@@ -33,39 +33,96 @@ SPCS Container
 
 ## Prerequisites
 
-1. **Snowflake CLI** with key-pair authentication configured
-   ```bash
-   snow connection test -c <your-connection>
-   ```
+- Snowflake account on **AWS** (Cortex AI features require AWS)
+- ACCOUNTADMIN role (or equivalent privileges)
+- Docker Desktop (for building the container image)
+- Snowflake CLI (`pip install snowflake-cli`)
+- Python 3.11+ (for JSON parsing in setup script)
+- openssl (for RSA key generation)
 
-2. **Docker Desktop** (for building the container image)
+> **Note**: No `jq` dependency — all JSON parsing uses `python3`.
 
-3. **jq** (for JSON parsing in setup scripts)
-   ```bash
-   brew install jq  # macOS
-   ```
+## CLI Connection Setup
 
-4. **RSA key-pair** already assigned to your Snowflake user
-   - The setup script reuses your existing key from `~/.snowflake/connections.toml`
-   - It will NOT overwrite existing RSA_PUBLIC_KEY slots
+The setup script uses the Snowflake CLI (`snow`) to connect. You must configure **key-pair JWT authentication** in your CLI connection — browser-based auth will not work because the setup script runs non-interactively.
+
+### 1. Generate an RSA Key Pair (if you don't have one)
+
+```bash
+mkdir -p ~/.snowflake/keys
+openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt > ~/.snowflake/keys/<connection_name>.p8
+chmod 600 ~/.snowflake/keys/<connection_name>.p8
+```
+
+Assign the public key to your Snowflake user:
+```bash
+openssl rsa -in ~/.snowflake/keys/<connection_name>.p8 -pubout -out /tmp/key.pub
+PUBLIC_KEY=$(grep -v 'BEGIN\|END' /tmp/key.pub | tr -d '\n')
+```
+```sql
+ALTER USER <username> SET RSA_PUBLIC_KEY='<PUBLIC_KEY>';
+```
+
+### 2. Configure `~/.snowflake/connections.toml`
+
+```toml
+[<connection_name>]
+account = "<ORG>-<ACCOUNT>"
+user = "<USERNAME>"
+authenticator = "SNOWFLAKE_JWT"
+private_key_file = "~/.snowflake/keys/<connection_name>.p8"
+role = "ACCOUNTADMIN"
+```
+
+**Key points:**
+- `authenticator` must be `SNOWFLAKE_JWT` (not `externalbrowser`)
+- `private_key_file` points to the `.p8` key from step 1
+- Do NOT set `warehouse` — the setup script creates one
+
+### 3. Configure `~/.snowflake/config.toml`
+
+```toml
+default_connection_name = "<connection_name>"
+```
+
+### 4. Verify
+
+```bash
+snow sql --connection <connection_name> -q "SELECT CURRENT_USER()"
+```
 
 ## Quick Start
 
 ```bash
 git clone https://github.com/azbarbarian2020/Digital_Twin_Truck_Configurator_v2.git
 cd Digital_Twin_Truck_Configurator_v2
-./setup.sh -c <your-connection-name>
+./setup.sh
 ```
 
+**Estimated time**: 10-20 minutes (mostly Docker build + SPCS startup)
+
 The setup script will:
-1. Detect your account info and RSA key from the CLI connection
-2. Create database, schema, warehouse, compute pool, image repository
-3. Create a private key secret (reusing your existing key)
-4. Create external access integration with `ALLOWED_AUTHENTICATION_SECRETS`
-5. Load BOM data and create semantic view
-6. Harden network policies (three-part fix for SE demo accounts)
-7. Build and push Docker image
-8. Deploy the SPCS service
+
+1. Prompt for your Snowflake CLI connection name
+2. Auto-detect your account, host, and registry
+3. Prompt for database, schema, warehouse, and compute pool names
+4. Create all infrastructure (database, schema, warehouse, compute pool, image repo)
+5. Set up RSA key-pair authentication (with safe key management)
+6. Create network rules and external access integration
+7. Load BOM data, truck options, and app tables
+8. Create semantic view
+9. Harden network policies (three-part fix for SE demo accounts)
+10. Build and push the Docker image
+11. Deploy the SPCS service
+12. Print the application URL
+
+### Safe Key Management
+
+If you already have an RSA key configured for another SPCS app (like midstream-pdm_v2), the setup script will detect this and offer options:
+
+1. **Reuse existing key** — Auto-detected from `connections.toml` (recommended if key file found)
+2. **Use RSA_PUBLIC_KEY_2** — Both apps work simultaneously (recommended if no key file found)
+3. **Generate new key** — Warning: breaks other SPCS apps
 
 ## What's Different from V1
 
@@ -86,9 +143,9 @@ The setup script will:
 
 | Script | Purpose |
 |--------|---------|
-| `setup.sh -c <conn>` | Full automated deployment |
-| `teardown.sh -c <conn> -d <db>` | Safe cleanup (preserves RSA keys) |
-| `fix_network_policy.sh -c <conn>` | Fix after 12-hour enforcement task |
+| `./setup.sh` | Full automated deployment (interactive prompts) |
+| `./teardown.sh` | Safe cleanup (preserves RSA keys) |
+| `./fix_network_policy.sh` | Fix after 12-hour enforcement task |
 
 ## Network Policy (SE Demo Accounts)
 
@@ -100,7 +157,7 @@ Snowflake SE demo accounts run `ACCOUNT_LEVEL_NETWORK_POLICY_TASK` every 12 hour
 
 If SPCS stops working after ~12 hours, run:
 ```bash
-./fix_network_policy.sh -c <your-connection>
+./fix_network_policy.sh
 ```
 
 ## Environment Variables (SPCS Container)
