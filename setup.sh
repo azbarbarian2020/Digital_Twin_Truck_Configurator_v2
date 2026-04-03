@@ -322,7 +322,7 @@ load_data() {
 
     local tmpdir
     tmpdir=$(mktemp -d)
-    for f in 02_data.sql 02b_bom_data.sql 02c_truck_options.sql 02d_app_tables.sql; do
+    for f in 02_data.sql 02b_bom_data.sql 02c_truck_options.sql 02d_app_tables.sql 02e_upload_procedure.sql; do
         if [ -f "$SCRIPT_DIR/scripts/$f" ]; then
             sed "s/BOM\.BOM4/${DATABASE}.${SCHEMA}/g; s/__WAREHOUSE__/${SNOWFLAKE_WAREHOUSE}/g" "$SCRIPT_DIR/scripts/$f" > "$tmpdir/$f"
             snow_sql -f "$tmpdir/$f"
