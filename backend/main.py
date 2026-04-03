@@ -1266,9 +1266,127 @@ async def upload_engineering_doc(
                 print(f"Search refresh warning: {refresh_err}")
                 yield f"data: {json.dumps({'step': 'search', 'status': 'done', 'message': 'Auto-refresh scheduled'})}\n\n"
             
-            # Step 5: Analyze (optional)
-            yield f"data: {json.dumps({'step': 'analyze', 'status': 'active', 'message': 'Analyzing...'})}\n\n"
-            yield f"data: {json.dumps({'step': 'analyze', 'status': 'done'})}\n\n"
+            # Step 5: Extract validation rules via Cortex Search + Cortex Complete
+            yield f"data: {json.dumps({'step': 'analyze', 'status': 'active', 'message': 'Extracting validation rules...'})}\n\n"
+            
+            rules_count = 0
+            try:
+                linked_option_id = None
+                if parts_list and len(parts_list) > 0:
+                    linked_option_id = parts_list[0].get('optionId')
+
+                search_queries = [
+                    'minimum boost pressure PSI turbocharger requirements',
+                    'cooling capacity BTU radiator requirements',
+                    'torque rating transmission requirements',
+                    'braking horsepower engine brake requirements',
+                    'component specifications minimum requirements'
+                ]
+
+                relevant_chunks = []
+                for sq in search_queries:
+                    try:
+                        search_request = json.dumps({
+                            "query": sq,
+                            "columns": ["CHUNK_TEXT", "DOC_ID"],
+                            "filter": {"@eq": {"DOC_ID": doc_id}},
+                            "limit": 3
+                        }).replace("'", "''")
+
+                        search_result = query(f"""
+                            SELECT SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
+                                '{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_SEARCH',
+                                '{search_request}'
+                            )::VARCHAR as RESULTS
+                        """)
+
+                        if search_result and search_result[0].get("RESULTS"):
+                            parsed = json.loads(search_result[0]["RESULTS"])
+                            for r in (parsed.get("results") or []):
+                                ct = r.get("CHUNK_TEXT", "")
+                                if ct and ct not in relevant_chunks:
+                                    relevant_chunks.append(ct)
+                    except Exception as search_err:
+                        print(f"Search query failed: {sq} - {search_err}")
+
+                if relevant_chunks:
+                    combined_text = '\n\n---\n\n'.join(relevant_chunks)[:6000]
+
+                    prompt = f"""Extract component requirements from these engineering specification sections.
+
+DOCUMENT: {doc_title}
+
+RELEVANT SECTIONS:
+{combined_text}
+
+Extract numeric requirements for supporting components. Valid component groups and their spec names:
+- Turbocharger: boost_psi, max_hp_supported
+- Radiator: cooling_capacity_btu, core_rows
+- Transmission Type: torque_rating_lb_ft
+- Engine Brake Type: braking_hp, brake_stages
+- Frame Rails: yield_strength_psi, rbm_rating_in_lb
+- Axle Rating: gawr_lb, beam_thickness_in
+- Front Suspension Type: spring_rating_lb
+- Rear Suspension Type: spring_rating_lb
+
+For each requirement mentioned, return JSON with the EXACT componentGroup name from above.
+
+Return JSON array:
+[
+  {{"componentGroup": "Turbocharger", "specName": "boost_psi", "minValue": 45, "unit": "PSI", "rawRequirement": "minimum 45 PSI boost"}},
+  {{"componentGroup": "Frame Rails", "specName": "yield_strength_psi", "minValue": 80000, "unit": "PSI", "rawRequirement": "80,000 PSI yield strength"}}
+]
+
+Return [] if no numeric requirements found. Return ONLY the JSON array."""
+
+                    prompt_escaped = prompt.replace("'", "''").replace("\\", "\\\\")
+                    ai_result = query(f"""
+                        SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{prompt_escaped}') AS RESPONSE
+                    """)
+
+                    if ai_result and ai_result[0].get("RESPONSE"):
+                        import re
+                        response_text = ai_result[0]["RESPONSE"].strip()
+                        response_text = re.sub(r'```json\s*', '', response_text)
+                        response_text = re.sub(r'```\s*', '', response_text)
+
+                        json_match = re.search(r'\[[\s\S]*\]', response_text)
+                        if json_match:
+                            rules = json.loads(json_match.group(0))
+                            option_id_sql = f"'{linked_option_id}'" if linked_option_id else "NULL"
+
+                            for rule in rules:
+                                escaped_raw = (rule.get('rawRequirement') or '').replace("'", "''")
+                                escaped_group = (rule.get('componentGroup') or '').replace("'", "''")
+                                escaped_spec = (rule.get('specName') or '').replace("'", "''")
+                                escaped_unit = (rule.get('unit') or '').replace("'", "''")
+                                min_val = rule.get('minValue')
+                                max_val = rule.get('maxValue')
+                                min_sql = str(min_val) if min_val is not None else 'NULL'
+                                max_sql = str(max_val) if max_val is not None else 'NULL'
+
+                                query(f"""
+                                    INSERT INTO {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.VALIDATION_RULES
+                                    (DOC_ID, DOC_TITLE, LINKED_OPTION_ID, COMPONENT_GROUP,
+                                     SPEC_NAME, MIN_VALUE, MAX_VALUE, UNIT, RAW_REQUIREMENT)
+                                    VALUES (
+                                        '{doc_id}',
+                                        '{doc_title.replace("'", "''")}',
+                                        {option_id_sql},
+                                        '{escaped_group}',
+                                        '{escaped_spec}',
+                                        {min_sql},
+                                        {max_sql},
+                                        '{escaped_unit}',
+                                        '{escaped_raw}'
+                                    )
+                                """)
+                                rules_count += 1
+
+                yield f"data: {json.dumps({'step': 'analyze', 'status': 'done', 'message': f'{rules_count} rules extracted'})}\n\n"
+            except Exception as analyze_err:
+                print(f"Validation rules extraction error: {analyze_err}")
+                yield f"data: {json.dumps({'step': 'analyze', 'status': 'done', 'message': f'Analysis complete ({rules_count} rules)'})}\n\n"
             
             # Final result
             yield f"data: {json.dumps({'type': 'result', 'success': True, 'docId': doc_id, 'docTitle': doc_title, 'chunkCount': len(chunks), 'linkedParts': parts_list})}\n\n"
