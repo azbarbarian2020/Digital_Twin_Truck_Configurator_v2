@@ -67,7 +67,8 @@ CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION TRUCK_CONFIG_EXTERNAL_ACCESS
 -- ============================================
 -- STEP 7: Create Engineering Docs Stage
 -- ============================================
-CREATE STAGE IF NOT EXISTS __DATABASE__.__SCHEMA__.ENGINEERING_DOCS_STAGE;
+CREATE STAGE IF NOT EXISTS __DATABASE__.__SCHEMA__.ENGINEERING_DOCS_STAGE
+  ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 
 -- ============================================
 -- Verification
