@@ -1615,7 +1615,7 @@ function VerifyModal({ validation, selectedOptions, allOptions, onClose, onApply
   ).size;
   
   const isValid = validation.issues.length === 0;
-  const hasFixPlan = validation.fixPlan && (validation.fixPlan.add.length > 0 || validation.fixPlan.remove.length > 0);
+  const hasFixPlan = validation.fixPlan && ((validation.fixPlan.add?.length || 0) > 0 || (validation.fixPlan.remove?.length || 0) > 0);
 
   function applyFixPlan() {
     if (!onApplyFix || !validation.fixPlan) return;

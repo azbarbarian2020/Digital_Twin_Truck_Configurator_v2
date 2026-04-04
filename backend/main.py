@@ -147,7 +147,8 @@ def query(sql: str) -> List[Dict]:
         cursor.execute(sql)
         if cursor.description:
             columns = [col[0] for col in cursor.description]
-            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+            rows = cursor.fetchall()
+            return [dict(zip(columns, row)) for row in rows]
         return []
     finally:
         cursor.close()
@@ -891,8 +892,12 @@ def validate_config(req: ValidateRequest):
         for opt in selected_options:
             cg = opt['COMPONENT_GROUP']
             options_by_group[cg] = opt
-            if opt.get('SPECS'):
-                specs = opt['SPECS'] if isinstance(opt['SPECS'], dict) else json.loads(opt['SPECS']) if opt['SPECS'] else {}
+            raw_specs = opt.get('SPECS')
+            if raw_specs:
+                try:
+                    specs = json.loads(raw_specs) if isinstance(raw_specs, str) else raw_specs if isinstance(raw_specs, dict) else {}
+                except:
+                    specs = {}
                 selected_specs[cg] = specs
         
         validation_rules = query(f"""
@@ -989,13 +994,13 @@ def validate_config(req: ValidateRequest):
                 
                 for candidate in candidates:
                     cand_specs_raw = candidate.get('SPECS')
-                    if isinstance(cand_specs_raw, dict):
-                        cand_specs = cand_specs_raw
-                    elif isinstance(cand_specs_raw, str):
+                    if isinstance(cand_specs_raw, str):
                         try:
                             cand_specs = json.loads(cand_specs_raw)
                         except:
                             cand_specs = {}
+                    elif isinstance(cand_specs_raw, dict):
+                        cand_specs = cand_specs_raw
                     else:
                         cand_specs = {}
                     
@@ -1553,6 +1558,12 @@ async def delete_engineering_doc(req: DeleteDocRequest):
             WHERE DOC_ID = '{doc_id}'
         """)
         
+        # Delete validation rules linked to this document
+        query(f"""
+            DELETE FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.VALIDATION_RULES
+            WHERE DOC_ID = '{doc_id}'
+        """)
+        
         # Remove from stage
         try:
             filename = doc_path.split("/")[-1]
@@ -1561,11 +1572,7 @@ async def delete_engineering_doc(req: DeleteDocRequest):
         except:
             pass
         
-        # Refresh search service
-        try:
-            query(f"ALTER CORTEX SEARCH SERVICE {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_SEARCH REFRESH")
-        except:
-            pass
+        # Search index updates via target_lag automatically
         
         return {"success": True, "deletedDocId": req.docId, "docTitle": doc_title}
     except HTTPException:

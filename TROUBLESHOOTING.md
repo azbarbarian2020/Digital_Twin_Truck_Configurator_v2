@@ -132,7 +132,37 @@ private_key_file = "~/.snowflake/keys/mykey.p8"
 openssl pkey -in ~/.snowflake/keys/mykey.p8 -pubout -outform DER | openssl dgst -sha256 -binary | base64
 
 # Remote fingerprint
-snow sql -q "DESCRIBE USER <username>" -c <connection> --format json | jq '.[] | select(.property=="RSA_PUBLIC_KEY_FP")'
+snow sql -q "DESCRIBE USER <username>" -c <connection> --format json | python3 -c "import sys,json; [print(r) for r in json.load(sys.stdin) if r.get('property')=='RSA_PUBLIC_KEY_FP']"
 ```
 
 If they don't match, you may need to update the RSA_PUBLIC_KEY on the user or use the correct private key file.
+
+## SPECS Data Shows NULL / Validation Fails
+
+**Symptom**: Validation endpoint returns no issues, or all SPECS values are NULL.
+
+**Cause**: The `02b_bom_data.sql` script may have been loaded without the SPECS column (13th column with `PARSE_JSON()`).
+
+**Check**:
+```bash
+snow sql -q "SELECT COUNT(*), COUNT(SPECS) FROM BOM.TRUCK_CONFIG.BOM_TBL;" -c <connection>
+```
+Both counts should be 253. If `COUNT(SPECS)` is 0, SPECS data is missing.
+
+**Important**: Do NOT use the `snowflake_sql_execute` IDE tool to verify VARIANT columns — it can report non-null values when the actual data is NULL. Always use `snow sql` CLI.
+
+**Fix**: Re-run the BOM data load:
+```bash
+snow sql -f scripts/02b_bom_data.sql -c <connection>
+```
+
+## Warehouse Not Found After Teardown
+
+**Symptom**: `snow connection test` or `snow sql` fails with "No active warehouse" after running teardown.
+
+**Cause**: The user's `DEFAULT_WAREHOUSE` still points to the dropped warehouse.
+
+**Fix**:
+```sql
+ALTER USER <username> UNSET DEFAULT_WAREHOUSE;
+```

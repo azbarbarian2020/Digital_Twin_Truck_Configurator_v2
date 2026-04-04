@@ -39,18 +39,23 @@ read -p "Schema name [TRUCK_CONFIG]: " SCHEMA
 SCHEMA=${SCHEMA:-TRUCK_CONFIG}
 read -p "Compute Pool name [TRUCK_CONFIG_POOL]: " COMPUTE_POOL
 COMPUTE_POOL=${COMPUTE_POOL:-TRUCK_CONFIG_POOL}
+read -p "Warehouse name [TRUCK_CONFIG_WH]: " WAREHOUSE
+WAREHOUSE=${WAREHOUSE:-TRUCK_CONFIG_WH}
 echo ""
+
+USERNAME=$(snow_sql -q "SELECT CURRENT_USER()" --format json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['CURRENT_USER()'])" 2>/dev/null || echo "")
 
 echo -e "${YELLOW}This will remove:${NC}"
 echo "  - Service: ${DATABASE}.${SCHEMA}.TRUCK_CONFIGURATOR_SVC"
 echo "  - External Access Integration: TRUCK_CONFIG_EXTERNAL_ACCESS"
 echo "  - Compute Pool: ${COMPUTE_POOL}"
+echo "  - Warehouse: ${WAREHOUSE}"
 echo "  - Schema: ${DATABASE}.${SCHEMA} (all tables, views, secrets within)"
 echo ""
 echo -e "${GREEN}This will NOT remove:${NC}"
-echo "  - RSA public keys on user"
-echo "  - User-level network policies"
-echo "  - Account-level network policy entries"
+echo "  - RSA public keys on user (safe for other SPCS apps)"
+echo "  - User-level network policy (setup.sh re-applies during fresh install)"
+echo "  - Account-level network policy entries (other apps may depend on them)"
 echo "  - Database: ${DATABASE} (only the schema is dropped)"
 echo ""
 
@@ -81,6 +86,16 @@ echo -e "${BOLD}Dropping schema ${DATABASE}.${SCHEMA}...${NC}"
 snow_sql -q "DROP SCHEMA IF EXISTS ${DATABASE}.${SCHEMA} CASCADE;"
 echo -e "${GREEN}✓ Schema dropped${NC}"
 
+echo -e "${BOLD}Dropping warehouse...${NC}"
+snow_sql -q "DROP WAREHOUSE IF EXISTS ${WAREHOUSE};"
+echo -e "${GREEN}✓ Warehouse dropped${NC}"
+
+if [ -n "$USERNAME" ]; then
+    echo -e "${BOLD}Unsetting DEFAULT_WAREHOUSE for ${USERNAME}...${NC}"
+    snow_sql -q "ALTER USER ${USERNAME} UNSET DEFAULT_WAREHOUSE;"
+    echo -e "${GREEN}✓ DEFAULT_WAREHOUSE unset${NC}"
+fi
+
 echo ""
 echo -e "${GREEN}=================================================================${NC}"
 echo -e "${GREEN}  Teardown Complete${NC}"
@@ -88,5 +103,6 @@ echo -e "${GREEN}===============================================================
 echo ""
 echo "  Preserved:"
 echo "    - RSA keys on user (safe for other SPCS apps)"
-echo "    - User-level network policies"
+echo "    - User-level network policy (setup.sh re-applies during install)"
+echo "    - Account-level network policy entries"
 echo "    - Database ${DATABASE} (drop manually if desired)"

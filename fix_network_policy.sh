@@ -178,8 +178,7 @@ fi
 echo ""
 echo -e "${BOLD}Part 3: User-level network policy${NC}"
 
-if [ -n "$ACCT_POLICY" ]; then
-    COMBINED_IPS=$(python3 -c "
+COMBINED_IPS=$(python3 -c "
 ip_list = '''${IP_LIST:-}'''
 spcs = '$SPCS_CIDR'
 ips = [ip.strip().strip(\"'\") for ip in ip_list.split(',') if ip.strip()]
@@ -188,13 +187,18 @@ if spcs not in ips:
 print(','.join([f\"'{ip}'\" for ip in ips]))
 ")
 
+if [ -n "$ACCT_POLICY" ]; then
     snow_sql -q "CREATE OR REPLACE NETWORK POLICY TRUCK_CONFIG_USER_POLICY ALLOWED_IP_LIST = ($COMBINED_IPS) COMMENT = 'User-level NP: VPN IPs + SPCS CIDR. Immune to account-level security task.';" 2>/dev/null || true
     snow_sql -q "ALTER USER ${USERNAME} SET NETWORK_POLICY = TRUCK_CONFIG_USER_POLICY;" 2>/dev/null || true
     echo -e "  ${GREEN}✓ User-level policy: TRUCK_CONFIG_USER_POLICY${NC}"
 else
-    snow_sql -q "CREATE OR REPLACE NETWORK POLICY TRUCK_CONFIG_USER_POLICY ALLOWED_IP_LIST = ('0.0.0.0/0') COMMENT = 'User-level NP: allow all (no account policy detected).';" 2>/dev/null || true
+    echo -e "  ${CYAN}No account-level network policy detected.${NC}"
+    echo -e "  ${CYAN}Creating user-level policy with SPCS CIDR only.${NC}"
+    echo -e "  ${YELLOW}NOTE: If you need VPN IPs in this policy, re-run after an account policy is set,${NC}"
+    echo -e "  ${YELLOW}or manually add IPs: ALTER NETWORK POLICY TRUCK_CONFIG_USER_POLICY SET ALLOWED_IP_LIST = (...);${NC}"
+    snow_sql -q "CREATE OR REPLACE NETWORK POLICY TRUCK_CONFIG_USER_POLICY ALLOWED_IP_LIST = ('${SPCS_CIDR}') COMMENT = 'User-level NP: SPCS CIDR. Re-run fix_network_policy.sh after account policy is set to include VPN IPs.';" 2>/dev/null || true
     snow_sql -q "ALTER USER ${USERNAME} SET NETWORK_POLICY = TRUCK_CONFIG_USER_POLICY;" 2>/dev/null || true
-    echo -e "  ${GREEN}✓ User-level policy: TRUCK_CONFIG_USER_POLICY (allow all)${NC}"
+    echo -e "  ${GREEN}✓ User-level policy: TRUCK_CONFIG_USER_POLICY (SPCS CIDR only)${NC}"
 fi
 
 echo ""
