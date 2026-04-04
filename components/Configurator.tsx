@@ -95,7 +95,7 @@ export function Configurator({ model, selectedOptions, setSelectedOptions, onSav
     
     const targetOption = targetOptionId ? allOptions.find(o => o.OPTION_ID === targetOptionId) : undefined;
     const initialSteps: Record<string, {status: string; message?: string}> = targetOptionId 
-      ? { upload: { status: 'pending' }, extract: { status: 'pending' }, chunk: { status: 'pending' }, search: { status: 'pending' }, analyze: { status: 'pending' } }
+      ? { upload: { status: 'pending' }, extract: { status: 'pending' }, chunk: { status: 'pending' }, search: { status: 'pending' }, rules: { status: 'pending' } }
       : { upload: { status: 'pending' }, extract: { status: 'pending' }, chunk: { status: 'pending' }, search: { status: 'pending' }, detect: { status: 'pending' } };
     
     setUploadModal({
@@ -1285,7 +1285,7 @@ export function Configurator({ model, selectedOptions, setSelectedOptions, onSav
                   { key: 'extract', label: 'Extracting text from PDF' },
                   { key: 'chunk', label: 'Chunking content' },
                   { key: 'search', label: 'Adding to search index' },
-                  { key: 'analyze', label: 'Analyzing specifications' }
+                  { key: 'rules', label: 'Extracting validation rules (AI)' }
                 ] : [
                   { key: 'upload', label: 'Uploading to stage' },
                   { key: 'extract', label: 'Extracting text from PDF' },

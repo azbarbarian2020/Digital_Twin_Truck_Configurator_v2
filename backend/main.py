@@ -1068,30 +1068,42 @@ def get_engineering_docs():
         docs = query(f"""
             SELECT 
                 DOC_ID, DOC_TITLE, DOC_PATH,
-                COUNT(*) as CHUNK_COUNT,
-                MIN(CREATED_AT) as CREATED_AT,
-                MAX(LINKED_PARTS)::VARCHAR as LINKED_PARTS
+                COUNT(*) as CHUNK_COUNT
             FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_CHUNKED
             GROUP BY DOC_ID, DOC_TITLE, DOC_PATH
-            ORDER BY 5 DESC
+            ORDER BY DOC_TITLE
         """)
+        
+        linked_parts_data = query(f"""
+            SELECT DISTINCT vr.DOC_ID, vr.LINKED_OPTION_ID, 
+                   b.OPTION_NM, b.COMPONENT_GROUP
+            FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.VALIDATION_RULES vr
+            JOIN {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.BOM_TBL b 
+                ON b.OPTION_ID = vr.LINKED_OPTION_ID
+            WHERE vr.LINKED_OPTION_ID IS NOT NULL
+        """)
+        
+        doc_linked_parts = {}
+        for row in linked_parts_data:
+            doc_id = row['DOC_ID']
+            if doc_id not in doc_linked_parts:
+                doc_linked_parts[doc_id] = []
+            doc_linked_parts[doc_id].append({
+                'optionId': row['LINKED_OPTION_ID'],
+                'optionName': row['OPTION_NM'],
+                'componentGroup': row['COMPONENT_GROUP']
+            })
         
         results = []
         for doc in docs:
-            linked_parts = []
-            if doc.get("LINKED_PARTS"):
-                try:
-                    linked_parts = json.loads(doc["LINKED_PARTS"])
-                except:
-                    pass
+            linked_parts = doc_linked_parts.get(doc["DOC_ID"], [])
             
             results.append({
                 "docId": doc["DOC_ID"],
                 "docTitle": doc["DOC_TITLE"],
                 "docPath": doc["DOC_PATH"],
                 "chunkCount": doc["CHUNK_COUNT"],
-                "linkedParts": linked_parts,
-                "createdAt": str(doc["CREATED_AT"])
+                "linkedParts": linked_parts
             })
         
         return {"docs": results}
