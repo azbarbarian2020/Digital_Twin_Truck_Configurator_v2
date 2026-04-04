@@ -866,91 +866,192 @@ class ValidateRequest(BaseModel):
 
 @app.post("/api/validate")
 def validate_config(req: ValidateRequest):
-    """Validate configuration using Cortex Search against engineering docs"""
+    """Validate configuration using pre-stored VALIDATION_RULES (fast path)"""
     try:
         if not req.selectedOptions:
             return {"isValid": True, "issues": [], "fixPlan": None}
         
-        options_to_check = req.incrementalOnly if req.incrementalOnly else req.selectedOptions
-        option_list = ",".join([f"'{o}'" for o in options_to_check])
+        model_id = req.modelId
         
-        # Get option details
+        print(f"\n=== VALIDATION API CALLED ===")
+        print(f"Validating {len(req.selectedOptions)} options for model {model_id}")
+        
+        option_list = ",".join([f"'{o}'" for o in req.selectedOptions])
+        
         options_sql = f"""
-            SELECT b.OPTION_ID, b.OPTION_NM, b.COMPONENT_GROUP, b.PERFORMANCE_CATEGORY
-            FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.BOM_TBL b
-            WHERE b.OPTION_ID IN ({option_list})
+            SELECT OPTION_ID, OPTION_NM, COMPONENT_GROUP, SYSTEM_NM, 
+                   PERFORMANCE_CATEGORY, SPECS
+            FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.BOM_TBL
+            WHERE OPTION_ID IN ({option_list})
         """
-        selected_option_details = query(options_sql)
+        selected_options = query(options_sql)
+        
+        options_by_group = {}
+        selected_specs = {}
+        for opt in selected_options:
+            cg = opt['COMPONENT_GROUP']
+            options_by_group[cg] = opt
+            if opt.get('SPECS'):
+                specs = opt['SPECS'] if isinstance(opt['SPECS'], dict) else json.loads(opt['SPECS']) if opt['SPECS'] else {}
+                selected_specs[cg] = specs
+        
+        validation_rules = query(f"""
+            SELECT vr.RULE_ID, vr.DOC_ID, vr.DOC_TITLE, vr.LINKED_OPTION_ID,
+                   vr.COMPONENT_GROUP, vr.SPEC_NAME, vr.MIN_VALUE, vr.MAX_VALUE,
+                   vr.UNIT, vr.RAW_REQUIREMENT
+            FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.VALIDATION_RULES vr
+            WHERE vr.LINKED_OPTION_ID IN ({option_list})
+        """)
+        
+        print(f"Found {len(validation_rules)} validation rules for selected options")
+        
+        rules_by_component = {}
+        for rule in validation_rules:
+            cg = rule['COMPONENT_GROUP']
+            if cg not in rules_by_component:
+                rules_by_component[cg] = []
+            rules_by_component[cg].append(rule)
         
         issues = []
-        to_remove = []
-        to_add = []
+        component_fixes = {}
         
-        # Search engineering docs for each option using Cortex Search
-        for opt in selected_option_details:
-            opt_id = opt["OPTION_ID"]
-            opt_name = opt["OPTION_NM"]
-            component_group = opt["COMPONENT_GROUP"]
+        for component_group, rules in rules_by_component.items():
+            selected_opt = options_by_group.get(component_group, {})
+            selected_spec = selected_specs.get(component_group, {})
             
-            # Use Cortex Search to find relevant engineering requirements
-            search_results = call_cortex_search(f"{opt_name} {component_group} requirements compatibility")
+            if not selected_opt:
+                continue
             
-            for doc in search_results:
-                chunk_text = doc.get("CHUNK_TEXT", "")
-                doc_title = doc.get("DOC_TITLE", "")
+            opt_name = selected_opt.get('OPTION_NM', 'Unknown')
+            opt_id = selected_opt.get('OPTION_ID', '')
+            doc_title = rules[0]['DOC_TITLE'] if rules else ''
+            
+            print(f"Checking {opt_name} against {len(rules)} rules for {component_group}")
+            
+            failed_specs = []
+            all_passed = True
+            
+            for rule in rules:
+                spec_name = rule['SPEC_NAME']
+                min_val = rule['MIN_VALUE']
+                max_val = rule['MAX_VALUE']
+                unit = rule['UNIT'] or ''
                 
-                # Use Cortex Complete to analyze if there are compatibility issues
-                analysis_prompt = f"""Analyze if this BOM option is compatible based on the engineering document.
-
-BOM Option: {opt_name} (ID: {opt_id}, Component: {component_group})
-Currently Selected Options: {', '.join(req.selectedOptions[:20])}
-
-Engineering Document: {doc_title}
-Relevant Text: {chunk_text[:1500]}
-
-If there are compatibility issues, required options, or incompatible options mentioned, respond with JSON:
-{{"hasIssue": true, "issueType": "missing_required" or "incompatible", "message": "brief description", "relatedOptionId": "ID if mentioned"}}
-
-If compatible or no issues found, respond with:
-{{"hasIssue": false}}
-
-Respond with ONLY the JSON object."""
-
-                analysis = call_cortex_complete(analysis_prompt, "mistral-large2")
+                actual_value = selected_spec.get(spec_name, 0) if selected_spec else 0
                 
-                try:
-                    json_match = analysis.strip()
-                    if json_match.startswith("{"):
-                        result = json.loads(json_match.split("}")[0] + "}")
-                        if result.get("hasIssue"):
-                            issues.append({
-                                "type": result.get("issueType", "warning"),
-                                "message": result.get("message", f"Potential issue with {opt_name}"),
-                                "severity": "error" if result.get("issueType") == "incompatible" else "warning",
-                                "optionId": opt_id,
-                                "docTitle": doc_title
-                            })
-                            if result.get("relatedOptionId"):
-                                if result.get("issueType") == "missing_required":
-                                    to_add.append(result["relatedOptionId"])
-                                elif result.get("issueType") == "incompatible":
-                                    to_remove.append(result["relatedOptionId"])
-                except (json.JSONDecodeError, IndexError):
-                    pass
+                if min_val is not None and actual_value < float(min_val):
+                    print(f"  X {spec_name}={actual_value} < {min_val} X")
+                    all_passed = False
+                    failed_specs.append({
+                        "specName": spec_name,
+                        "currentValue": float(actual_value) if actual_value else 0,
+                        "requiredValue": float(min_val),
+                        "unit": unit,
+                        "reason": f"{spec_name}={actual_value} {unit} < required {min_val} {unit}"
+                    })
+                elif min_val is not None:
+                    try:
+                        print(f"  OK {spec_name}={float(actual_value):,.0f} >= {float(min_val):,.0f} OK")
+                    except:
+                        print(f"  OK {spec_name}={actual_value} >= {min_val} OK")
+                
+                if max_val is not None and actual_value > float(max_val):
+                    all_passed = False
+                    failed_specs.append({
+                        "specName": spec_name,
+                        "currentValue": actual_value,
+                        "requiredValue": float(max_val),
+                        "unit": unit,
+                        "reason": f"{spec_name}={actual_value} {unit} > max {max_val} {unit}"
+                    })
+            
+            if not all_passed:
+                issue = {
+                    "type": "requirement",
+                    "title": f"{opt_name} Incompatible",
+                    "message": f"{opt_name} does not meet {len(failed_specs)} specification(s)",
+                    "relatedOptions": [opt_id],
+                    "sourceDoc": doc_title,
+                    "specMismatches": failed_specs
+                }
+                
+                print(f"  Finding cheapest {component_group} meeting ALL {len(rules)} requirements...")
+                escaped_component = component_group.replace("'", "''")
+                candidates = query(f"""
+                    SELECT b.OPTION_ID, b.OPTION_NM, b.COST_USD, b.SPECS
+                    FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.BOM_TBL b
+                    JOIN {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.TRUCK_OPTIONS t ON b.OPTION_ID = t.OPTION_ID
+                    WHERE t.MODEL_ID = '{model_id}'
+                      AND b.COMPONENT_GROUP = '{escaped_component}'
+                    ORDER BY b.COST_USD ASC
+                """)
+                print(f"  Evaluating {len(candidates)} candidates...")
+                
+                for candidate in candidates:
+                    cand_specs_raw = candidate.get('SPECS')
+                    if isinstance(cand_specs_raw, dict):
+                        cand_specs = cand_specs_raw
+                    elif isinstance(cand_specs_raw, str):
+                        try:
+                            cand_specs = json.loads(cand_specs_raw)
+                        except:
+                            cand_specs = {}
+                    else:
+                        cand_specs = {}
+                    
+                    meets_all = True
+                    for rule in rules:
+                        spec_name = rule['SPEC_NAME']
+                        min_val = rule['MIN_VALUE']
+                        max_val = rule['MAX_VALUE']
+                        cand_value = cand_specs.get(spec_name, 0)
+                        
+                        if min_val is not None and cand_value < float(min_val):
+                            meets_all = False
+                            break
+                        if max_val is not None and cand_value > float(max_val):
+                            meets_all = False
+                            break
+                    
+                    if meets_all:
+                        print(f"  CHEAPEST meeting ALL: {candidate['OPTION_NM']} (${candidate['COST_USD']:,.0f})")
+                        issue['fixOptionId'] = candidate['OPTION_ID']
+                        issue['fixOptionName'] = candidate['OPTION_NM']
+                        component_fixes[component_group] = {
+                            "removeId": opt_id,
+                            "removeName": opt_name,
+                            "addId": candidate['OPTION_ID'],
+                            "addName": candidate['OPTION_NM']
+                        }
+                        break
+                
+                issues.append(issue)
         
-        is_valid = len([i for i in issues if i["severity"] == "error"]) == 0
+        is_valid = len(issues) == 0
+        print(f"Validation complete: isValid={is_valid}, issues={len(issues)}")
+        print(f"=== VALIDATION END ===\n")
+        
         fix_plan = None
-        
-        if not is_valid and (to_remove or to_add):
+        if component_fixes:
+            remove_ids = []
+            add_ids = []
+            
+            for cg, fix in component_fixes.items():
+                remove_ids.append(fix["removeId"])
+                add_ids.append(fix["addId"])
+            
             fix_plan = {
-                "remove": list(set(to_remove)),
-                "add": list(set(to_add)),
-                "summary": f"Remove {len(set(to_remove))} incompatible, add {len(set(to_add))} required"
+                "explanation": f"Replace {len(remove_ids)} component(s) to meet engineering specifications",
+                "remove": remove_ids,
+                "add": add_ids
             }
         
         return {"isValid": is_valid, "issues": issues, "fixPlan": fix_plan}
+        
     except Exception as e:
         print(f"Validation error: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============ AI DESCRIPTION ============

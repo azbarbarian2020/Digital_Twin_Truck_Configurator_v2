@@ -631,8 +631,8 @@ build_and_push() {
     docker tag "$IMAGE_PATH" "${REPO_URL}/truck-config:latest"
 
     echo "  Pushing image..."
-    docker push "$IMAGE_PATH"
-    docker push "${REPO_URL}/truck-config:latest"
+    HTTPS_PROXY="" HTTP_PROXY="" NO_PROXY="${REGISTRY_HOST}" docker push "$IMAGE_PATH"
+    HTTPS_PROXY="" HTTP_PROXY="" NO_PROXY="${REGISTRY_HOST}" docker push "${REPO_URL}/truck-config:latest"
     echo -e "${GREEN}✓ Image pushed to Snowflake registry${NC}\n"
 }
 
