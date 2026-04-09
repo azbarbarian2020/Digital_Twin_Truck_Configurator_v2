@@ -1659,13 +1659,13 @@ async def delete_engineering_doc(req: DeleteDocRequest):
             WHERE DOC_ID = '{doc_id}'
         """)
         
-        # Remove from stage
+        # Remove from stage (quote path to handle parentheses/special chars in filenames)
         try:
             filename = doc_path.split("/")[-1]
             if filename:
-                query(f"REMOVE @{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_STAGE/{filename}")
+                query(f"REMOVE '@{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_STAGE/{filename}'")
         except Exception as stage_err:
-            print(f"Warning: Could not remove stage file: {stage_err}")
+            print(f"Warning: Could not remove stage file {filename}: {stage_err}")
         
         # Refresh search index
         try:
