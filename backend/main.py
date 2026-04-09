@@ -670,7 +670,12 @@ def chat(req: ChatRequest):
         lower_msg = message.lower()
         
         # Check if asking about engineering docs / specifications
-        is_doc_query = any(kw in lower_msg for kw in ['specification', 'document', 'attached', 'linked', 'spec doc', 'engineering doc', 'which options have', 'what has'])
+        is_doc_query = any(kw in lower_msg for kw in [
+            'specification', 'document', 'attached', 'linked', 'spec doc',
+            'engineering doc', 'which options have', 'what has', 'upload',
+            'file', 'pdf', 'object', 'part has', 'requirement', 'what docs',
+            'which parts', 'what objects'
+        ])
         
         if is_doc_query:
             return handle_doc_query(message, model_id)
@@ -744,7 +749,28 @@ def chat(req: ChatRequest):
             # If AI fails, provide helpful message
             return {"response": f"I understood your request: '{message}'. However, I couldn't generate a valid optimization. Try being more specific, like 'maximize power and safety' or 'minimize all costs'."}
         
-        # For non-optimization queries, use Cortex Complete for conversation
+        # For non-optimization queries, check engineering docs for context via Cortex Search
+        search_results = call_cortex_search(message, limit=3)
+        if search_results:
+            context_chunks = []
+            for r in search_results:
+                chunk = r.get("CHUNK_TEXT", "") if isinstance(r, dict) else ""
+                if chunk:
+                    context_chunks.append(chunk)
+            if context_chunks:
+                context = "\n\n".join(context_chunks)[:4000]
+                search_prompt = f"""You are a truck configuration assistant. Use the following engineering document context to answer the user's question.
+
+ENGINEERING DOCUMENT CONTEXT:
+{context}
+
+USER QUESTION: {message}
+
+Provide a helpful, concise answer based on the context. If the context doesn't help answer the question, say so and provide general truck configuration guidance."""
+                ai_response = call_cortex_complete(search_prompt, "mistral-large2")
+                if ai_response:
+                    return {"response": ai_response}
+
         ai_response = call_cortex_complete(f"User asked about truck configuration: {message}. Provide a helpful, concise response about truck configuration options.", "mistral-large2")
         if ai_response:
             return {"response": ai_response}
@@ -758,36 +784,46 @@ def chat(req: ChatRequest):
 def handle_doc_query(message: str, model_id: str) -> Dict[str, Any]:
     """Handle questions about engineering documents and linked parts"""
     try:
-        # Query engineering docs with their linked parts - LINKED_PARTS contains objects with optionId key
         docs_with_parts = query(f"""
-            SELECT DISTINCT 
-                d.DOC_ID, d.DOC_TITLE,
-                lp.value:optionId::VARCHAR as LINKED_OPTION_ID,
-                lp.value:optionName::VARCHAR as LINKED_OPTION_NAME,
-                b.OPTION_ID, b.OPTION_NM, b.SYSTEM_NM, b.SUBSYSTEM_NM, b.COMPONENT_GROUP
-            FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_CHUNKED d,
-                 LATERAL FLATTEN(input => d.LINKED_PARTS) lp
-            JOIN {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.BOM_TBL b 
-                ON b.OPTION_ID = lp.value:optionId::VARCHAR
-            WHERE d.LINKED_PARTS IS NOT NULL AND ARRAY_SIZE(d.LINKED_PARTS) > 0
-            ORDER BY b.SYSTEM_NM, b.SUBSYSTEM_NM, b.COMPONENT_GROUP
+            SELECT DISTINCT
+                vr.DOC_TITLE, vr.LINKED_OPTION_ID,
+                b.OPTION_NM, b.SYSTEM_NM, b.SUBSYSTEM_NM, b.COMPONENT_GROUP
+            FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.VALIDATION_RULES vr
+            JOIN {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.BOM_TBL b
+                ON b.OPTION_ID = vr.LINKED_OPTION_ID
+            WHERE vr.LINKED_OPTION_ID IS NOT NULL
+            ORDER BY b.OPTION_NM
         """)
+
+        rule_groups = query(f"""
+            SELECT DOC_TITLE, LISTAGG(DISTINCT COMPONENT_GROUP, ', ') 
+                WITHIN GROUP (ORDER BY COMPONENT_GROUP) as RULE_GROUPS
+            FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.VALIDATION_RULES
+            GROUP BY DOC_TITLE
+        """)
+        rule_groups_map = {r['DOC_TITLE']: r['RULE_GROUPS'] for r in rule_groups} if rule_groups else {}
         
         if not docs_with_parts:
             return {"response": "No engineering specification documents are currently linked to any BOM options. You can upload documents and link them to specific parts in the Engineering Docs panel."}
         
-        # Build response
+        seen = set()
         response_lines = ["**Options with Specification Documents:**\n"]
         for doc in docs_with_parts:
-            opt_name = doc.get("OPTION_NM", "") or doc.get("LINKED_OPTION_NAME", "")
+            opt_name = doc.get("OPTION_NM", "")
             doc_title = doc.get("DOC_TITLE", "")
+            key = f"{opt_name}:{doc_title}"
+            if key in seen:
+                continue
+            seen.add(key)
             system = doc.get("SYSTEM_NM", "")
             subsystem = doc.get("SUBSYSTEM_NM", "")
             cg = doc.get("COMPONENT_GROUP", "")
+            groups = rule_groups_map.get(doc_title, cg)
             
             path = f"{system} → {subsystem} → {cg}"
             response_lines.append(f"• **{opt_name}** has document: *{doc_title}*")
-            response_lines.append(f"  BOM Path: {path}\n")
+            response_lines.append(f"  BOM Path: {path}")
+            response_lines.append(f"  Validation rules cover: {groups}\n")
         
         return {"response": "\n".join(response_lines)}
     except Exception as e:
@@ -1285,6 +1321,20 @@ async def upload_engineering_doc(
             doc_id = f"DOC-{uuid.uuid4().hex[:8]}"
             doc_title = filename
             staged_filename = doc_title.replace("'", "").replace(" ", "_")
+
+            try:
+                existing = query(f"""
+                    SELECT DISTINCT DOC_ID FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_CHUNKED
+                    WHERE DOC_TITLE = '{doc_title.replace("'", "''")}'
+                    LIMIT 1
+                """)
+                if existing:
+                    old_doc_id = existing[0]['DOC_ID']
+                    print(f"Cleaning up existing doc {old_doc_id} for {doc_title}")
+                    query(f"DELETE FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_CHUNKED WHERE DOC_ID = '{old_doc_id}'")
+                    query(f"DELETE FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.VALIDATION_RULES WHERE DOC_ID = '{old_doc_id}'")
+            except Exception as cleanup_err:
+                print(f"Warning: dedup cleanup failed: {cleanup_err}")
             
             # Step 1: Upload to stage
             yield f"data: {json.dumps({'step': 'upload', 'status': 'active', 'message': 'Uploading to stage...'})}\n\n"
@@ -1385,25 +1435,37 @@ async def upload_engineering_doc(
             print(f"Inserted {chunks_inserted}/{len(chunks)} chunks for {doc_title}")
             yield f"data: {json.dumps({'step': 'chunk', 'status': 'done', 'message': f'{chunks_inserted} chunks'})}\n\n"
             
-            # Step 4: Search index (handled by target_lag, no sync refresh needed)
-            yield f"data: {json.dumps({'step': 'search', 'status': 'done', 'message': 'Auto-indexed'})}\n\n"
+            # Step 4: Refresh search index
+            yield f"data: {json.dumps({'step': 'search', 'status': 'active', 'message': 'Refreshing search index...'})}\n\n"
+            try:
+                query(f"ALTER CORTEX SEARCH SERVICE {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_SEARCH REFRESH")
+                yield f"data: {json.dumps({'step': 'search', 'status': 'done', 'message': 'Search index refreshed'})}\n\n"
+            except Exception as search_err:
+                print(f"Warning: Search refresh failed: {search_err}")
+                yield f"data: {json.dumps({'step': 'search', 'status': 'done', 'message': 'Auto-indexed (refresh pending)'})}\n\n"
             
             # Step 5: Extract validation rules using Cortex Complete
             print(f"DEBUG: Starting rule extraction for {doc_title}, chunks: {len(chunks)}")
             yield f"data: {json.dumps({'step': 'rules', 'status': 'active', 'message': 'Extracting validation rules...'})}\n\n"
             
+            linked_option_id = parts_list[0].get('optionId') if parts_list else None
             rules_created = 0
-            try:
-                linked_option_id = parts_list[0].get('optionId') if parts_list else None
-                
-                combined_text = '\n\n'.join(chunks[:5])[:6000]
-                
-                prompt = f"""Extract component requirements from this engineering specification.
+            rule_error_msg = None
 
-DOCUMENT: {doc_title}
+            combined_text = '\n\n'.join(chunks[:5])[:6000]
+            combined_text_escaped = combined_text.replace("\\", "\\\\").replace("'", "''")
+            doc_title_escaped = doc_title.replace("'", "''")
+
+            import re
+            max_retries = 2
+            for attempt in range(max_retries + 1):
+                try:
+                    prompt = f"""Extract component requirements from this engineering specification.
+
+DOCUMENT: {doc_title_escaped}
 
 CONTENT:
-{combined_text}
+{combined_text_escaped}
 
 Extract numeric requirements for supporting components. Valid component groups and their spec names:
 - Turbocharger: boost_psi, max_hp_supported
@@ -1423,65 +1485,98 @@ Return JSON array:
   {{"componentGroup": "Frame Rails", "specName": "yield_strength_psi", "minValue": 80000, "unit": "PSI", "rawRequirement": "80,000 PSI yield strength"}}
 ]
 
-Return [] if no numeric requirements found. Return ONLY the JSON array.""".replace("'", "''")
-                
-                ai_result = query(f"""
-                    SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{prompt}') AS RESPONSE
-                """)
-                
-                print(f"DEBUG: Cortex Complete returned {len(ai_result)} rows")
-                if ai_result and len(ai_result) > 0:
+Return [] if no numeric requirements found. Return ONLY the JSON array."""
+
+                    prompt_escaped = prompt.replace("\\", "\\\\").replace("'", "''")
+
+                    ai_result = query(f"""
+                        SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{prompt_escaped}') AS RESPONSE
+                    """)
+
+                    if not ai_result or len(ai_result) == 0:
+                        rule_error_msg = f"CORTEX.COMPLETE returned no result (attempt {attempt + 1})"
+                        print(f"DEBUG: {rule_error_msg}")
+                        continue
+
                     response = ai_result[0].get("RESPONSE", "").strip()
-                    print(f"DEBUG: AI response: {response[:200]}...")
-                    response = response.replace("```json", "").replace("```", "")
-                    
-                    import re
-                    json_match = re.search(r'\[[\s\S]*\]', response)
-                    if json_match:
-                        rules = json.loads(json_match.group(0))
-                        
-                        for rule in rules:
-                            component_group = rule.get('componentGroup', '').replace("'", "''")
-                            spec_name = rule.get('specName', '').replace("'", "''")
-                            min_value = rule.get('minValue')
-                            max_value = rule.get('maxValue')
-                            unit = rule.get('unit', '').replace("'", "''")
-                            raw_req = rule.get('rawRequirement', '').replace("'", "''")
-                            
-                            if min_value is None and max_value is None:
-                                continue
-                            
-                            rule_id = str(uuid.uuid4())[:36]
-                            min_val_sql = min_value if min_value is not None else "NULL"
-                            max_val_sql = max_value if max_value is not None else "NULL"
-                            
-                            query(f"""
-                                INSERT INTO {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.VALIDATION_RULES
-                                (RULE_ID, DOC_ID, DOC_TITLE, LINKED_OPTION_ID, COMPONENT_GROUP, 
-                                 SPEC_NAME, MIN_VALUE, MAX_VALUE, UNIT, RAW_REQUIREMENT)
-                                VALUES (
-                                    '{rule_id}',
-                                    '{doc_id}',
-                                    '{doc_title.replace("'", "''")}',
-                                    '{linked_option_id if linked_option_id else 'UNKNOWN'}',
-                                    '{component_group}',
-                                    '{spec_name}',
-                                    {min_val_sql},
-                                    {max_val_sql},
-                                    '{unit}',
-                                    '{raw_req}'
-                                )
-                            """)
-                            rules_created += 1
-                        
+                    print(f"DEBUG: AI response (attempt {attempt + 1}): {response[:300]}...")
+                    response = response.replace("```json", "").replace("```", "").strip()
+
+                    json_match = re.search(r'\[[\s\S]*?\]', response)
+                    if not json_match:
+                        rule_error_msg = f"No JSON array found in LLM response (attempt {attempt + 1})"
+                        print(f"DEBUG: {rule_error_msg}. Raw response: {response[:500]}")
+                        continue
+
+                    rules = json.loads(json_match.group(0))
+                    if not isinstance(rules, list):
+                        rule_error_msg = f"LLM returned non-list JSON (attempt {attempt + 1})"
+                        print(f"DEBUG: {rule_error_msg}")
+                        continue
+
+                    valid_groups = {'Turbocharger', 'Radiator', 'Transmission Type', 'Engine Brake Type',
+                                    'Frame Rails', 'Axle Rating', 'Front Suspension Type', 'Rear Suspension Type'}
+                    for rule in rules:
+                        if not isinstance(rule, dict):
+                            continue
+                        component_group = rule.get('componentGroup', '').replace("'", "''")
+                        spec_name = rule.get('specName', '').replace("'", "''")
+                        min_value = rule.get('minValue')
+                        max_value = rule.get('maxValue')
+                        unit = rule.get('unit', '').replace("'", "''")
+                        raw_req = rule.get('rawRequirement', '').replace("'", "''")
+
+                        if min_value is None and max_value is None:
+                            continue
+                        if component_group.replace("''", "'") not in valid_groups:
+                            print(f"DEBUG: Skipping rule with invalid componentGroup: {component_group}")
+                            continue
+
+                        rule_id = str(uuid.uuid4())[:36]
+                        min_val_sql = min_value if min_value is not None else "NULL"
+                        max_val_sql = max_value if max_value is not None else "NULL"
+                        option_id_sql = f"'{linked_option_id}'" if linked_option_id else "NULL"
+
+                        query(f"""
+                            INSERT INTO {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.VALIDATION_RULES
+                            (RULE_ID, DOC_ID, DOC_TITLE, LINKED_OPTION_ID, COMPONENT_GROUP,
+                             SPEC_NAME, MIN_VALUE, MAX_VALUE, UNIT, RAW_REQUIREMENT)
+                            VALUES (
+                                '{rule_id}',
+                                '{doc_id}',
+                                '{doc_title_escaped}',
+                                {option_id_sql},
+                                '{component_group}',
+                                '{spec_name}',
+                                {min_val_sql},
+                                {max_val_sql},
+                                '{unit}',
+                                '{raw_req}'
+                            )
+                        """)
+                        rules_created += 1
+
+                    if rules_created > 0:
                         print(f"Created {rules_created} validation rules for {doc_title}")
-                
-            except Exception as rule_err:
-                import traceback
-                print(f"Rule extraction error: {rule_err}")
-                print(f"DEBUG traceback: {traceback.format_exc()}")
-            
-            yield f"data: {json.dumps({'step': 'rules', 'status': 'done', 'message': f'{rules_created} rules created'})}\n\n"
+                        rule_error_msg = None
+                        break
+                    else:
+                        rule_error_msg = f"LLM returned 0 valid rules (attempt {attempt + 1})"
+                        print(f"DEBUG: {rule_error_msg}")
+
+                except json.JSONDecodeError as je:
+                    rule_error_msg = f"JSON parse error: {je} (attempt {attempt + 1})"
+                    print(f"DEBUG: {rule_error_msg}")
+                except Exception as rule_err:
+                    import traceback
+                    rule_error_msg = f"Rule extraction error: {rule_err} (attempt {attempt + 1})"
+                    print(f"DEBUG: {rule_error_msg}")
+                    print(f"DEBUG traceback: {traceback.format_exc()}")
+
+            if rule_error_msg and rules_created == 0:
+                yield f"data: {json.dumps({'step': 'rules', 'status': 'error', 'message': rule_error_msg})}\n\n"
+            else:
+                yield f"data: {json.dumps({'step': 'rules', 'status': 'done', 'message': f'{rules_created} rules created'})}\n\n"
             
             # Final result
             yield f"data: {json.dumps({'type': 'result', 'success': True, 'docId': doc_id, 'docTitle': doc_title, 'chunkCount': len(chunks), 'linkedParts': parts_list, 'rulesCreated': rules_created})}\n\n"
@@ -1569,10 +1664,14 @@ async def delete_engineering_doc(req: DeleteDocRequest):
             filename = doc_path.split("/")[-1]
             if filename:
                 query(f"REMOVE @{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_STAGE/{filename}")
-        except:
-            pass
+        except Exception as stage_err:
+            print(f"Warning: Could not remove stage file: {stage_err}")
         
-        # Search index updates via target_lag automatically
+        # Refresh search index
+        try:
+            query(f"ALTER CORTEX SEARCH SERVICE {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_SEARCH REFRESH")
+        except Exception as search_err:
+            print(f"Warning: Search refresh after delete failed: {search_err}")
         
         return {"success": True, "deletedDocId": req.docId, "docTitle": doc_title}
     except HTTPException:
