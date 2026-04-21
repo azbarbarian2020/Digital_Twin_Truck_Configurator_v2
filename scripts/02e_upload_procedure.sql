@@ -1,3 +1,10 @@
+-- ============================================
+-- DEPRECATED: This stored procedure is NOT used by V2.
+-- V2 uses AI_PARSE_DOCUMENT with page_split directly in backend/main.py.
+-- This file is kept for historical reference only.
+-- setup.sh does NOT load this script.
+-- ============================================
+
 -- Digital Twin Truck Configurator - Upload and Parse Document Stored Procedure
 -- Receives base64-encoded file content, uploads to stage, and parses with PARSE_DOCUMENT
 -- Called by the Python backend upload endpoint

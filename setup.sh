@@ -94,8 +94,8 @@ gather_config() {
     SCHEMA=${SCHEMA:-TRUCK_CONFIG}
     read -p "Compute Pool name [TRUCK_CONFIG_POOL]: " COMPUTE_POOL
     COMPUTE_POOL=${COMPUTE_POOL:-TRUCK_CONFIG_POOL}
-    read -p "Warehouse name [DEMO_WH]: " SNOWFLAKE_WAREHOUSE
-    SNOWFLAKE_WAREHOUSE=${SNOWFLAKE_WAREHOUSE:-DEMO_WH}
+    read -p "Warehouse name [TRUCK_CONFIG_WH]: " SNOWFLAKE_WAREHOUSE
+    SNOWFLAKE_WAREHOUSE=${SNOWFLAKE_WAREHOUSE:-TRUCK_CONFIG_WH}
     echo ""
     echo -e "  Database:      ${CYAN}${DATABASE}${NC}"
     echo -e "  Schema:        ${CYAN}${SCHEMA}${NC}"
@@ -113,7 +113,7 @@ gather_config() {
 create_infrastructure() {
     echo -e "${BOLD}[1/9] Creating infrastructure...${NC}"
 
-    snow_sql -q "CREATE WAREHOUSE IF NOT EXISTS ${SNOWFLAKE_WAREHOUSE} WAREHOUSE_SIZE = 'XSMALL' AUTO_SUSPEND = 60 AUTO_RESUME = TRUE;"
+    snow_sql -q "CREATE WAREHOUSE IF NOT EXISTS ${SNOWFLAKE_WAREHOUSE} WAREHOUSE_SIZE = 'LARGE' AUTO_SUSPEND = 60 AUTO_RESUME = TRUE;"
     SNOW_WH="$SNOWFLAKE_WAREHOUSE"
 
     snow_sql -q "CREATE DATABASE IF NOT EXISTS ${DATABASE};"
@@ -322,7 +322,7 @@ load_data() {
 
     local tmpdir
     tmpdir=$(mktemp -d)
-    for f in 02_data.sql 02b_bom_data.sql 02c_truck_options.sql 02d_app_tables.sql 02e_upload_procedure.sql; do
+    for f in 02_data.sql 02b_bom_data.sql 02c_truck_options.sql 02d_app_tables.sql; do
         if [ -f "$SCRIPT_DIR/scripts/$f" ]; then
             sed "s/BOM\.BOM4/${DATABASE}.${SCHEMA}/g; s/__WAREHOUSE__/${SNOWFLAKE_WAREHOUSE}/g" "$SCRIPT_DIR/scripts/$f" > "$tmpdir/$f"
             snow_sql -f "$tmpdir/$f"
@@ -649,15 +649,13 @@ spec:
       env:
         SNOWFLAKE_ACCOUNT: ${ACCOUNT_LOCATOR}
         SNOWFLAKE_ACCOUNT_LOCATOR: ${SF_ACCOUNT_LOCATOR}
-        SNOWFLAKE_HOST: ${SNOWFLAKE_HOST}
         SNOWFLAKE_USER: ${SNOWFLAKE_USER}
         SNOWFLAKE_WAREHOUSE: ${SNOWFLAKE_WAREHOUSE}
         SNOWFLAKE_DATABASE: ${DATABASE}
         SNOWFLAKE_SCHEMA: ${SCHEMA}
         SNOWFLAKE_SEMANTIC_VIEW: ${DATABASE}.${SCHEMA}.TRUCK_CONFIG_ANALYST_V2
       secrets:
-        - snowflakeSecret:
-            objectName: ${DATABASE}.${SCHEMA}.SNOWFLAKE_PRIVATE_KEY_SECRET
+        - snowflakeSecret: ${DATABASE}.${SCHEMA}.SNOWFLAKE_PRIVATE_KEY_SECRET
           secretKeyRef: secret_string
           envVarName: SNOWFLAKE_PRIVATE_KEY
       resources:
@@ -668,7 +666,7 @@ spec:
           cpu: 2
           memory: 4Gi
   endpoints:
-    - name: web
+    - name: app
       port: 8080
       public: true
   networkPolicyConfig:

@@ -8,7 +8,7 @@
 
 **Fix**:
 ```bash
-./fix_network_policy.sh -c <your-connection>
+./fix_network_policy.sh
 ```
 
 This applies a three-part fix:
@@ -87,7 +87,7 @@ ALTER NETWORK POLICY <policy_name> SET ALLOWED_IP_LIST = (
 );
 ```
 
-Or run `./fix_network_policy.sh -c <connection>`.
+Or run `./fix_network_policy.sh`.
 
 ## Cannot Connect to Snowflake from Container
 

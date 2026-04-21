@@ -23,7 +23,6 @@ This proof-of-concept demonstrates how Snowflake's unified data platform can rev
 SPCS Container
 +------------------------------------------+
 |  Next.js Frontend (port 3000)            |
-|    -> Cortex Agent REST API (JWT)        |
 |    -> Cortex Analyst REST API (JWT)      |
 |                                          |
 |  Python Backend (port 8000)              |
@@ -56,11 +55,10 @@ SPCS Container
 
 | Service | Purpose |
 |---------|---------|
-| **Cortex Agent** | Orchestrated AI chat assistant with tool access |
 | **Cortex Analyst** | Natural language to SQL via semantic view |
 | **Cortex Complete** | Rule extraction from engineering documents |
 | **Cortex Search** | Semantic search over engineering specification PDFs |
-| **PARSE_DOCUMENT** | PDF text extraction |
+| **AI_PARSE_DOCUMENT** | PDF text extraction and page-level chunking |
 
 ## Prerequisites
 

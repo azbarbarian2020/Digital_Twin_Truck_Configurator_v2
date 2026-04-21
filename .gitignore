@@ -8,3 +8,4 @@ __pycache__/
 .DS_Store
 *.p8
 *.pem
+.snowflake/

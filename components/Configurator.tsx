@@ -95,8 +95,8 @@ export function Configurator({ model, selectedOptions, setSelectedOptions, onSav
     
     const targetOption = targetOptionId ? allOptions.find(o => o.OPTION_ID === targetOptionId) : undefined;
     const initialSteps: Record<string, {status: string; message?: string}> = targetOptionId 
-      ? { upload: { status: 'pending' }, extract: { status: 'pending' }, chunk: { status: 'pending' }, search: { status: 'pending' }, rules: { status: 'pending' } }
-      : { upload: { status: 'pending' }, extract: { status: 'pending' }, chunk: { status: 'pending' }, search: { status: 'pending' }, detect: { status: 'pending' } };
+      ? { upload: { status: 'pending' }, extract: { status: 'pending' }, rules: { status: 'pending' } }
+      : { upload: { status: 'pending' }, extract: { status: 'pending' }, detect: { status: 'pending' } };
     
     setUploadModal({
       fileName: file.name,
@@ -167,6 +167,9 @@ export function Configurator({ model, selectedOptions, setSelectedOptions, onSav
                   if (data.success) {
                     if (!targetOptionId && data.warning) setUploadWarning(data.warning);
                     await loadEngineeringDocs();
+                    if (data.rulesCreated > 0) {
+                      validateConfig();
+                    }
                     setUploadModal(prev => prev ? { ...prev, success: true } : null);
                     setTimeout(() => setUploadModal(null), 1500);
                     if (!targetOptionId) {
@@ -231,8 +234,7 @@ export function Configurator({ model, selectedOptions, setSelectedOptions, onSav
       steps: {
         lookup: { status: 'pending' },
         delete_chunks: { status: 'pending' },
-        delete_stage: { status: 'pending' },
-        refresh_search: { status: 'pending' }
+        delete_stage: { status: 'pending' }
       }
     });
     
@@ -272,6 +274,7 @@ export function Configurator({ model, selectedOptions, setSelectedOptions, onSav
                   clearTimeout(timeout);
                   if (data.success) {
                     await loadEngineeringDocs();
+                    validateConfig();
                     setTimeout(() => setDeleteProgress(null), 1500);
                   } else {
                     console.error("Delete failed:", data.error);
@@ -295,6 +298,7 @@ export function Configurator({ model, selectedOptions, setSelectedOptions, onSav
         if (!gotResult) {
           clearTimeout(timeout);
           await loadEngineeringDocs();
+          validateConfig();
           setTimeout(() => setDeleteProgress(null), 1500);
         }
       } else {
@@ -1225,8 +1229,7 @@ export function Configurator({ model, selectedOptions, setSelectedOptions, onSav
               {[
                 { key: 'lookup', label: 'Finding document' },
                 { key: 'delete_chunks', label: 'Removing indexed chunks' },
-                { key: 'delete_stage', label: 'Removing from stage' },
-                { key: 'refresh_search', label: 'Refreshing search index' }
+                { key: 'delete_stage', label: 'Removing from stage' }
               ].map(({ key, label }) => {
                 const step = deleteProgress.steps[key];
                 return (
@@ -1282,15 +1285,11 @@ export function Configurator({ model, selectedOptions, setSelectedOptions, onSav
               <div className="space-y-3">
                 {(uploadModal.optionId ? [
                   { key: 'upload', label: 'Uploading to stage' },
-                  { key: 'extract', label: 'Extracting text from PDF' },
-                  { key: 'chunk', label: 'Chunking content' },
-                  { key: 'search', label: 'Adding to search index' },
+                  { key: 'extract', label: 'Extracting & chunking document' },
                   { key: 'rules', label: 'Extracting validation rules (AI)' }
                 ] : [
                   { key: 'upload', label: 'Uploading to stage' },
-                  { key: 'extract', label: 'Extracting text from PDF' },
-                  { key: 'chunk', label: 'Chunking content' },
-                  { key: 'search', label: 'Adding to search index' },
+                  { key: 'extract', label: 'Extracting & chunking document' },
                   { key: 'detect', label: 'Detecting related parts' }
                 ]).map(({ key, label }) => {
                   const step = uploadModal.steps[key];

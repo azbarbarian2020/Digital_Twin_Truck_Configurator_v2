@@ -13,8 +13,8 @@ USE SCHEMA __DATABASE__.__SCHEMA__;
 -- ============================================
 -- STEP 2: Create Warehouse
 -- ============================================
-CREATE WAREHOUSE IF NOT EXISTS DEMO_WH
-  WAREHOUSE_SIZE = 'XSMALL'
+CREATE WAREHOUSE IF NOT EXISTS __WAREHOUSE__
+  WAREHOUSE_SIZE = 'LARGE'
   AUTO_SUSPEND = 60
   AUTO_RESUME = TRUE;
 
