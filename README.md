@@ -4,6 +4,8 @@
 
 # Digital Twin Truck Configurator V2
 
+[Watch the Demo Video](https://youtu.be/hfI-tKUpI7U)
+
 An AI-powered truck configuration tool running on Snowpark Container Services (SPCS) with Cortex AI integration.
 
 **V2 uses Key-Pair JWT authentication** (replaces PATs from V1), safely reuses existing RSA keys, and includes network policy hardening for Snowflake SE demo accounts.
@@ -58,7 +60,7 @@ SPCS Container
 | **Cortex Analyst** | Natural language to SQL via semantic view |
 | **Cortex Complete** | Rule extraction from engineering documents |
 | **Cortex Search** | Semantic search over engineering specification PDFs |
-| **AI_PARSE_DOCUMENT** | PDF text extraction and page-level chunking |
+| **AI_PARSE_DOCUMENT** | PDF text extraction (OCR mode for fast processing) |
 
 ## Prerequisites
 
@@ -268,7 +270,7 @@ Digital_Twin_Truck_Configurator_v2/
     02b_bom_data.sql          # BOM_TBL data (253 rows with SPECS)
     02c_truck_options.sql     # TRUCK_OPTIONS mappings
     02d_app_tables.sql        # VALIDATION_RULES, ENGINEERING_DOCS_CHUNKED, etc.
-    02e_upload_procedure.sql  # Document upload/parse stored procedure
+    02e_upload_procedure.sql  # Deprecated -- upload handled in backend/main.py
     03_semantic_view.sql      # Cortex Analyst semantic view
     05_service.sql            # Service creation template (manual reference)
   setup.sh                    # Full automated deployment
@@ -307,12 +309,10 @@ If SPCS stops working after ~12 hours, run:
 | `SNOWFLAKE_PRIVATE_KEY` | Secret mount | RSA private key PEM |
 | `SNOWFLAKE_ACCOUNT_LOCATOR` | Service spec | Account locator (e.g., `LNB24417`) |
 | `SNOWFLAKE_ACCOUNT` | Service spec | Org-account format |
-| `SNOWFLAKE_HOST` | Service spec | Full hostname |
 | `SNOWFLAKE_USER` | Service spec | Snowflake username |
 | `SNOWFLAKE_WAREHOUSE` | Service spec | Warehouse name |
 | `SNOWFLAKE_DATABASE` | Service spec | Database name |
 | `SNOWFLAKE_SCHEMA` | Service spec | Schema name |
-| `SNOWFLAKE_SEMANTIC_VIEW` | Service spec | Fully qualified semantic view |
 
 ## Engineering Specification Documents
 

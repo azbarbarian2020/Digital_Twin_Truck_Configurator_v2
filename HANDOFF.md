@@ -1,7 +1,7 @@
 # Digital Twin Truck Configurator V2 - Handoff Document
 
-**Last Updated:** April 21, 2026
-**Current Deployed Image:** `v2-1776795444`
+**Last Updated:** April 22, 2026
+**Current Deployed Image:** `v2-1776884230`
 **Service URL:** https://evdvpib-sfsenorthamerica-cleanbarbarian.snowflakecomputing.app
 **Status:** All features working (Configuration Assistant, Document Upload/Delete, Validation)
 
@@ -16,7 +16,7 @@ An interactive truck configuration tool deployed on Snowpark Container Services 
 | Feature | Description | Cortex Service |
 |---------|-------------|----------------|
 | **Configuration Assistant** | Natural language optimization ("maximize safety and comfort while minimizing cost") | Cortex Analyst (REST API + Semantic View) |
-| **Document Upload** | Upload PDF specs, auto-extract pages, generate validation rules | AI_PARSE_DOCUMENT + CORTEX.COMPLETE (mistral-large2) |
+| **Document Upload** | Upload PDF specs, OCR text extraction, dynamic rule generation | AI_PARSE_DOCUMENT (OCR) + CORTEX.COMPLETE (mistral-large2) |
 | **Document Search** | Chat-based Q&A against uploaded engineering docs | Cortex Search Service |
 | **Live Validation** | Real-time component validation against extracted rules | Direct SQL |
 | **Configuration Report** | PDF export with BOM, performance scores, validation status | Client-side jsPDF |
@@ -97,63 +97,60 @@ An interactive truck configuration tool deployed on Snowpark Container Services 
 
 ## 4. Document Upload Flow (The Hard Part)
 
-This is the most complex feature and the source of most bugs. The flow uses **Server-Sent Events (SSE)** with keepalive comments to prevent the SPCS ingress proxy from dropping idle connections (~30s timeout).
+This is the most complex feature and went through several architecture iterations. The current version uses a **POST + background thread + polling** pattern to avoid SPCS ingress proxy SSE connection drops.
 
-### Current Architecture (v2-1776795444)
+### Current Architecture (v2-1776884230)
 
 ```
-Client                    FastAPI Generator              Background Thread
+Client                    FastAPI                       Background Thread
   │                            │                              │
-  │  POST /upload (PDF)        │                              │
+  │  POST /upload (PDF+form)   │                              │
   │ ─────────────────────────▶ │                              │
-  │                            │  create upload_conn          │
-  │                            │                              │
-  │  SSE: upload=active        │                              │
-  │ ◀───────────────────────── │  PUT file to stage ─────────▶│ (upload_conn)
-  │  SSE: keepalive            │ ◀────────────────────────────│
-  │  SSE: upload=done          │                              │
-  │                            │                              │
-  │  SSE: extract=active       │                              │
-  │ ◀───────────────────────── │  AI_PARSE_DOCUMENT ─────────▶│ (upload_conn)
-  │  SSE: keepalive            │  + INSERT INTO CHUNKED       │
-  │  SSE: extract=done         │ ◀────────────────────────────│
-  │                            │                              │
-  │                            │  Fetch chunk text ──────────▶│ (upload_conn)
-  │                            │ ◀────────────────────────────│
-  │                            │                              │
-  │  SSE: rules=active         │                              │
-  │ ◀───────────────────────── │  CORTEX.COMPLETE ───────────▶│ (upload_conn)
-  │  SSE: keepalive            │  (mistral-large2)            │
-  │  SSE: rules=done           │ ◀────────────────────────────│
-  │                            │                              │
-  │                            │  Batch INSERT rules ────────▶│ (upload_conn)
-  │                            │ ◀────────────────────────────│
-  │                            │                              │
-  │  SSE: result=success       │  close upload_conn           │
+  │  {uploadId} (immediate)    │  spawn daemon thread ───────▶│
   │ ◀───────────────────────── │                              │
-  │                            │  fire-and-forget ───────────▶│ Search REFRESH
-  │                            │  (new connection, daemon)     │ (separate conn)
+  │                            │                              │  create bg_conn
+  │  GET /upload-status        │                              │  PUT file to stage
+  │ ─────────────────────────▶ │  read _pending_uploads       │
+  │  {step:'upload'}           │                              │
+  │ ◀───────────────────────── │                              │
+  │                            │                              │  AI_PARSE_DOCUMENT (OCR)
+  │  GET /upload-status        │                              │  INSERT INTO CHUNKED
+  │ ─────────────────────────▶ │                              │
+  │  {step:'extract'}          │                              │
+  │ ◀───────────────────────── │                              │
+  │                            │                              │  Dynamic CTE SQL:
+  │  GET /upload-status        │                              │   spec_catalog from BOM_TBL
+  │ ─────────────────────────▶ │                              │   CORTEX.COMPLETE
+  │  {step:'rules'}            │                              │   INSERT INTO VALIDATION_RULES
+  │ ◀───────────────────────── │                              │
+  │                            │                              │  Search REFRESH
+  │  GET /upload-status        │                              │  close bg_conn
+  │ ─────────────────────────▶ │                              │
+  │  {status:'done'}           │                              │
+  │ ◀───────────────────────── │                              │
 ```
 
 ### Key Design Decisions
 
-1. **Single connection (`upload_conn`)** used exclusively from background threads. The main thread NEVER executes SQL on it directly. This prevents the Snowflake Python connector thread-safety corruption that caused the "second upload hang" bug.
+1. **POST returns immediately** with `{uploadId}`. All SQL runs in a daemon background thread with its own connection (`bg_conn`). This avoids SPCS ingress proxy killing long-lived SSE connections (~30s timeout).
 
-2. **`_run_sql()` helper**: All SQL executes in a background thread. The main generator thread only yields SSE keepalive comments (`": keepalive\n\n"`) every 2 seconds while waiting.
+2. **`_pending_uploads` dict**: In-memory state tracking per upload (step, chunkCount, rulesCreated, error, message). Frontend polls `GET /upload-status?uploadId=X` every 2 seconds.
 
-3. **AI_PARSE_DOCUMENT with `page_split: true`**: Combines text extraction + page-level chunking + INSERT into a single SQL statement. Replaced the old 3-step flow (PARSE_DOCUMENT → Python text splitting → N individual INSERTs).
+3. **AI_PARSE_DOCUMENT in OCR mode**: Returns full document text in ~3 seconds (vs 3+ minutes in LAYOUT mode). Warehouse size does not affect performance.
 
-4. **Batch INSERT for validation rules**: Single multi-row `INSERT ... VALUES (row1), (row2), ...` instead of per-rule INSERT statements.
+4. **Dynamic rule extraction via single SQL INSERT with CTEs**: No hardcoded component groups. The SQL queries `BOM_TBL.SPECS` via `LATERAL FLATTEN(TRY_PARSE_JSON(TO_VARCHAR(SPECS)))` to build a runtime catalog of all component groups and their numeric spec names (74 specs across 41 groups). This catalog is injected into the CORTEX.COMPLETE prompt so the LLM knows what to extract from any properly structured document.
 
-5. **Search refresh is fire-and-forget**: After returning the success result to the client, a daemon thread creates a fresh connection and runs `ALTER CORTEX SEARCH SERVICE ... REFRESH`. Never blocks the upload flow.
+5. **LINKED_OPTION_ID**: Set from frontend's `linkedParts[0].optionId`. Required for validation queries which filter `WHERE vr.LINKED_OPTION_ID IN ({option_list})`.
+
+6. **Search refresh is fire-and-forget**: After updating `_pending_uploads` to `done`, runs `ALTER CORTEX SEARCH SERVICE ... REFRESH`.
 
 ### Upload UI Steps (3 steps)
 
 | Step Key | Label | Backend Action |
 |----------|-------|----------------|
-| `upload` | Uploading to stage | PUT file via `_run_sql` |
-| `extract` | Extracting & chunking document | AI_PARSE_DOCUMENT + INSERT via `_run_sql` |
-| `rules` | Extracting validation rules (AI) | CORTEX.COMPLETE + batch INSERT via `_run_sql` |
+| `upload` | Uploading to stage | PUT file to ENGINEERING_DOCS_STAGE |
+| `extract` | Extracting document text | AI_PARSE_DOCUMENT (OCR) + INSERT INTO ENGINEERING_DOCS_CHUNKED |
+| `rules` | Extracting validation rules (AI) | Dynamic CTE SQL: BOM_TBL spec catalog + CORTEX.COMPLETE + INSERT INTO VALIDATION_RULES |
 
 ---
 
@@ -179,9 +176,9 @@ The Snowflake Python connector connection objects are **NOT thread-safe**. Using
 
 **Pattern that fails:** Separate connections for main thread (`gen_conn`) and background thread (`thread_conn`) — still corrupts on second upload cycle.
 
-### SSE + SPCS Ingress Proxy
+### SPCS Ingress Proxy and SSE
 
-The SPCS ingress proxy drops connections with no data flowing for ~30 seconds. Every long-running SQL must yield keepalive comments (`": keepalive\n\n"`) to keep the SSE connection alive. This is why all SQL runs in background threads.
+The SPCS ingress proxy drops SSE connections after ~30 seconds of inactivity, even with keepalive comments. This is why the upload flow was rewritten from SSE to POST + polling. The proxy has no issue with short-lived request/response cycles.
 
 ### Service Spec Secrets Syntax
 
@@ -340,7 +337,8 @@ Drops service, EAI, compute pool, schema, and warehouse. Preserves RSA keys, use
 | PATCH | `/api/chat-history` | Save/update chat history |
 | GET | `/api/chat-history?sessionId=X` | Retrieve chat history |
 | POST | `/api/validate` | Validate configuration against rules |
-| POST | `/api/engineering-docs/upload` | Upload PDF (SSE streaming response) |
+| POST | `/api/engineering-docs/upload` | Upload PDF (returns uploadId, runs pipeline in background) |
+| GET | `/api/engineering-docs/upload-status` | Poll upload progress by uploadId |
 | DELETE | `/api/engineering-docs` | Delete a document and its rules |
 | GET | `/api/engineering-docs` | List uploaded documents |
 | GET | `/api/engineering-docs/view` | Get document text |
@@ -353,17 +351,18 @@ Drops service, EAI, compute pool, schema, and warehouse. Preserves RSA keys, use
 
 ## 9. Validation System
 
-When a document is uploaded with a linked option (e.g., "605 HP Engine"):
+When a document is uploaded with a linked option (e.g., "605 HP / 2050 lb-ft Maximum", OPTION_ID=134):
 
-1. `AI_PARSE_DOCUMENT` extracts text by page and inserts into `ENGINEERING_DOCS_CHUNKED`
-2. `CORTEX.COMPLETE` (mistral-large2) extracts numeric requirements as JSON rules
-3. Rules are inserted into `VALIDATION_RULES` with `COMPONENT_GROUP`, `SPEC_NAME`, `MIN_VALUE`, `MAX_VALUE`
+1. `AI_PARSE_DOCUMENT` (OCR mode) extracts full document text into `ENGINEERING_DOCS_CHUNKED`
+2. A single SQL INSERT with CTEs dynamically reads `BOM_TBL.SPECS` to build a catalog of all component groups and their numeric spec names
+3. `CORTEX.COMPLETE` (mistral-large2) receives this catalog + document text and extracts matching requirements as JSON
+4. Rules are parsed and inserted into `VALIDATION_RULES` with `LINKED_OPTION_ID`, `COMPONENT_GROUP`, `SPEC_NAME`, `MIN_VALUE`, `MAX_VALUE`
 
-Valid component groups: `Turbocharger`, `Radiator`, `Transmission Type`, `Engine Brake Type`, `Frame Rails`, `Axle Rating`, `Front Suspension Type`, `Rear Suspension Type`
+Component groups are NOT hardcoded -- the system dynamically discovers all groups with numeric specs from BOM_TBL at runtime (currently 41 groups, 74 numeric spec names).
 
 When `/api/validate` is called, the backend:
-1. Fetches all validation rules for selected options' component groups
-2. Compares each rule's `MIN_VALUE`/`MAX_VALUE` against the selected option's spec values (stored in `BOM_TBL.TECH_SPEC` VARIANT column)
+1. Fetches all validation rules where `LINKED_OPTION_ID` matches the selected options
+2. Compares each rule's `MIN_VALUE`/`MAX_VALUE` against the selected option's spec values (stored in `BOM_TBL.SPECS` VARIANT column)
 3. Returns pass/fail per rule with explanations
 
 The frontend auto-calls `validateConfig()` after upload success and delete success to refresh validation icons.
@@ -374,7 +373,10 @@ The frontend auto-calls `validateConfig()` after upload success and delete succe
 
 | Image Tag | Date | Changes |
 |-----------|------|---------|
-| `v2-1776795444` | Apr 21 | **Current.** AI_PARSE_DOCUMENT with page_split, single-connection upload, batch rule INSERT. Fixes second-upload hang. |
+| `v2-1776884230` | Apr 22 | **Current.** OCR mode (3s vs 3min LAYOUT), dynamic BOM_TBL rule extraction (single SQL), POST+polling (no SSE). |
+| `v2-1776878601` | Apr 22 | Background thread + polling (still LAYOUT mode, timed out on parse). |
+| `v2-1776875425` | Apr 22 | Partial SSE fix (rules only in background). Still failed. |
+| `v2-1776795444` | Apr 21 | AI_PARSE_DOCUMENT with page_split, single-connection upload, batch rule INSERT. Fixes second-upload hang. |
 | `v2-1776794043` | Apr 21 | SNOWFLAKE_HOST override to org-account URL. Dual-connection (still had second-upload hang). |
 | `v2-1776791977` | Apr 21 | Added SNOWFLAKE_ACCOUNT_LOCATOR env var. validateConfig() auto-refresh. |
 | `v2-1776790297` | Apr 21 | Per-query connections (too slow). Missing ACCOUNT_LOCATOR. |
@@ -390,4 +392,4 @@ The frontend auto-calls `validateConfig()` after upload success and delete succe
 - **Orphaned stage files**: Previous test uploads may have left files like `605_HP_Engine_Requirements_(9).pdf` on the stage. Run `LS @BOM.TRUCK_CONFIG.ENGINEERING_DOCS_STAGE;` and `REMOVE` unwanted files.
 - **Network policy enforcement task**: A `ACCOUNT_LEVEL_NETWORK_POLICY_TASK` runs every 12 hours and may remove the SPCS CIDR from the account network policy. `setup.sh` handles this by creating a user-level policy and updating the enforcement procedure, but `fix_network_policy.sh` can be run manually if needed.
 - **Text file uploads**: The text file path (`is_text`) doesn't use AI_PARSE_DOCUMENT — it inserts the raw text as a single chunk. This is fine for small text files but could be improved.
-- **Error handling for CORTEX.COMPLETE**: If the LLM returns malformed JSON, the code retries up to 2 times. Consider adding exponential backoff.
+- **AI_PARSE_DOCUMENT mode**: OCR mode runs in ~3 seconds. LAYOUT mode takes 3+ minutes even on small PDFs. Snowflake docs confirm warehouse size does not affect AI_PARSE_DOCUMENT performance. No reason to use LAYOUT unless page structure is needed.

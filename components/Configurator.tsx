@@ -115,7 +115,6 @@ export function Configurator({ model, selectedOptions, setSelectedOptions, onSav
       const formData = new FormData();
       formData.append("file", file);
       
-      // Python backend expects linkedParts as JSON array
       if (targetOptionId && targetOption) {
         const linkedParts = [{
           optionId: targetOptionId,
@@ -127,94 +126,74 @@ export function Configurator({ model, selectedOptions, setSelectedOptions, onSav
         formData.append("linkedParts", "[]");
       }
       
-      const timeout = setTimeout(() => {
-        console.warn("Upload operation timed out");
-        setUploadModal(prev => prev ? { ...prev, error: "Upload timed out" } : null);
-        if (!targetOptionId) {
-          setUploadWarning("Upload timed out");
-          setUploadingDoc(false);
-        }
-        loadEngineeringDocs();
-      }, 120000);
-      
+      setUploadModal(prev => prev ? {
+        ...prev,
+        steps: { ...prev.steps, upload: { status: 'active', message: 'Starting upload...' } }
+      } : null);
+
       const res = await fetch("/api/engineering-docs/upload", {
         method: "POST",
         body: formData
       });
-      
-      // Both Python and Next.js backends now use SSE streaming
-      const reader = res.body?.getReader();
-      const decoder = new TextDecoder();
-      
-      if (reader) {
-        let buffer = '';
-        let gotResult = false;
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n\n');
-          buffer = lines.pop() || '';
-          
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try {
-                const data = JSON.parse(line.slice(6));
-                if (data.type === 'result') {
-                  gotResult = true;
-                  clearTimeout(timeout);
-                  if (data.success) {
-                    if (!targetOptionId && data.warning) setUploadWarning(data.warning);
-                    await loadEngineeringDocs();
-                    if (data.rulesCreated > 0) {
-                      validateConfig();
-                    }
-                    setUploadModal(prev => prev ? { ...prev, success: true } : null);
-                    setTimeout(() => setUploadModal(null), 1500);
-                    if (!targetOptionId) {
-                      setUploadingDoc(false);
-                      setUploadProgress({});
-                    }
-                  } else {
-                    setUploadModal(prev => prev ? { ...prev, error: data.error || "Upload failed" } : null);
-                    if (!targetOptionId) {
-                      setUploadWarning(data.error || "Upload failed");
-                      setUploadingDoc(false);
-                    }
-                  }
-                } else if (data.step) {
-                  // Real progress update from backend
-                  setUploadModal(prev => prev ? {
-                    ...prev,
-                    steps: { ...prev.steps, [data.step]: { status: data.status, message: data.message } }
-                  } : null);
-                  if (!targetOptionId) {
-                    setUploadProgress(prev => ({
-                      ...prev,
-                      [data.step]: { status: data.status, message: data.message }
-                    }));
-                  }
-                }
-              } catch (parseErr) {
-                console.warn("Failed to parse SSE data:", parseErr);
+
+      if (!res.ok) {
+        throw new Error(`Upload failed: ${res.status}`);
+      }
+
+      const { uploadId } = await res.json();
+
+      for (let i = 0; i < 120; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+          const statusRes = await fetch(`/api/engineering-docs/upload-status?uploadId=${encodeURIComponent(uploadId)}`);
+          const st = await statusRes.json();
+
+          if (st.step) {
+            setUploadModal(prev => prev ? {
+              ...prev,
+              steps: {
+                ...prev.steps,
+                ...(st.step === 'extract' || st.step === 'rules' || st.step === 'done'
+                  ? { upload: { status: 'done', message: 'File staged' } } : {}),
+                ...(st.step === 'rules' || st.step === 'done'
+                  ? { extract: { status: 'done', message: `${st.chunkCount || 0} pages extracted` } } : {}),
+                ...(st.step === 'upload' ? { upload: { status: 'active', message: st.message } } : {}),
+                ...(st.step === 'extract' ? { extract: { status: 'active', message: st.message } } : {}),
+                ...(st.step === 'rules' ? { rules: { status: 'active', message: st.message } } : {}),
               }
+            } : null);
+            if (!targetOptionId && st.step) {
+              setUploadProgress(prev => ({ ...prev, [st.step]: { status: 'active', message: st.message } }));
             }
           }
-        }
-        if (!gotResult) {
-          clearTimeout(timeout);
-          await loadEngineeringDocs();
-          setUploadModal(prev => prev ? { ...prev, success: true } : null);
-          setTimeout(() => setUploadModal(null), 1500);
-          if (!targetOptionId) {
-            setUploadingDoc(false);
-            setUploadProgress({});
+
+          if (st.status === 'done') {
+            await loadEngineeringDocs();
+            setUploadModal(prev => prev ? {
+              ...prev,
+              success: true,
+              steps: {
+                upload: { status: 'done', message: 'File staged' },
+                extract: { status: 'done', message: `${st.chunkCount || 0} pages extracted` },
+                rules: { status: st.rulesCreated > 0 ? 'done' : 'error', message: st.message }
+              }
+            } : null);
+            if (st.rulesCreated > 0) validateConfig();
+            setTimeout(() => setUploadModal(null), 1500);
+            if (!targetOptionId) { setUploadingDoc(false); setUploadProgress({}); }
+            return;
+          } else if (st.status === 'error') {
+            setUploadModal(prev => prev ? { ...prev, error: st.error || 'Upload failed' } : null);
+            await loadEngineeringDocs();
+            if (!targetOptionId) { setUploadWarning(st.error || 'Upload failed'); setUploadingDoc(false); }
+            return;
           }
-        }
-      } else {
-        clearTimeout(timeout);
+        } catch { /* keep polling */ }
       }
+
+      setUploadModal(prev => prev ? { ...prev, error: 'Upload timed out' } : null);
+      await loadEngineeringDocs();
+      if (!targetOptionId) { setUploadWarning('Upload timed out'); setUploadingDoc(false); }
     } catch (error) {
       console.error("Upload error:", error);
       setUploadModal(prev => prev ? { ...prev, error: "Upload failed - please try again" } : null);

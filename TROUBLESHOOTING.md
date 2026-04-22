@@ -156,6 +156,29 @@ Both counts should be 253. If `COUNT(SPECS)` is 0, SPECS data is missing.
 snow sql -f scripts/02b_bom_data.sql -c <connection>
 ```
 
+## Document Upload Times Out or Fails
+
+**Symptom**: Upload modal spins indefinitely or shows an error after uploading a PDF.
+
+**Background**: The upload pipeline runs AI_PARSE_DOCUMENT (OCR) + CORTEX.COMPLETE in a background thread. The frontend polls `GET /upload-status` every 2 seconds for up to 4 minutes (120 polls).
+
+**Check service logs**:
+```sql
+SELECT SYSTEM$GET_SERVICE_LOGS('BOM.TRUCK_CONFIG.TRUCK_CONFIGURATOR_SVC', 0, 'truck-configurator', 500);
+```
+
+Look for lines starting with `DEBUG:` in the upload pipeline.
+
+**Common causes**:
+1. **AI_PARSE_DOCUMENT timeout** — If using LAYOUT mode instead of OCR, parsing can take 3+ minutes. The current code uses OCR mode (~3 seconds). Check that `'mode': 'OCR'` is in the SQL.
+2. **CORTEX.COMPLETE JSON parse failure** — The LLM may return markdown-wrapped JSON. The SQL uses `REGEXP_SUBSTR(REPLACE(REPLACE(response, '```json', ''), '```', ''), '\\[\\s\\S]*\\]')` to strip it.
+3. **No matching component groups** — If the document mentions components not in BOM_TBL, zero rules will be created. This is normal (rules_created=0 is not an error).
+4. **LINKED_OPTION_ID not set** — If no linked part is selected in the UI, rules are inserted with NULL LINKED_OPTION_ID and won't appear in validation. Upload with a linked option selected.
+
+**AI_PARSE_DOCUMENT modes**:
+- **OCR** (~3 seconds): Returns full text as single block. Current default.
+- **LAYOUT** (3+ minutes): Returns page-by-page structured content. Warehouse size does NOT affect performance.
+
 ## Warehouse Not Found After Teardown
 
 **Symptom**: `snow connection test` or `snow sql` fails with "No active warehouse" after running teardown.

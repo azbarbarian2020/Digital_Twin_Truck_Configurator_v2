@@ -6,7 +6,6 @@ import base64
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import snowflake.connector
 import requests
@@ -39,6 +38,7 @@ if SNOWFLAKE_ACCOUNT and (not SNOWFLAKE_HOST or SNOWFLAKE_ACCOUNT_LOCATOR.lower(
 _connection = None
 _jwt_token = None
 _jwt_expiry = 0
+_pending_uploads: Dict[str, Dict[str, Any]] = {}
 
 
 def generate_jwt_token() -> str:
@@ -1304,439 +1304,270 @@ async def upload_engineering_doc(
     file: UploadFile = File(...),
     linkedParts: str = Form(default="[]")
 ):
-    """Upload, extract, chunk and index an engineering document with SSE progress"""
     import uuid
-    import base64
-    
-    # CRITICAL: Read file content BEFORE creating the generator
-    # The file handle will be closed after the request handler returns
+    import threading
+
     content = await file.read()
     filename = file.filename or "Untitled"
-    
-    def generate_progress():
-        import threading
 
-        upload_conn = _create_connection()
+    try:
+        parts_list = json.loads(linkedParts)
+    except:
+        parts_list = []
 
-        def _run_sql(sql):
-            """Run SQL on upload_conn in a background thread, yielding keepalives."""
-            result_box = {}
-            def _run():
-                try:
-                    cursor = upload_conn.cursor()
-                    try:
-                        cursor.execute(sql)
-                        if cursor.description:
-                            columns = [col[0] for col in cursor.description]
-                            rows = cursor.fetchall()
-                            result_box['data'] = [dict(zip(columns, row)) for row in rows]
-                        else:
-                            result_box['data'] = []
-                    finally:
-                        cursor.close()
-                except Exception as ex:
-                    result_box['error'] = ex
-            t = threading.Thread(target=_run)
-            t.start()
-            while t.is_alive():
-                yield ": keepalive\n\n"
-                t.join(timeout=2)
-            if 'error' in result_box:
-                raise result_box['error']
-            return result_box.get('data', [])
+    upload_id = f"UPL-{uuid.uuid4().hex[:8]}"
+    doc_id = f"DOC-{uuid.uuid4().hex[:8]}"
+    doc_title = filename
+    staged_filename = doc_title.replace("'", "").replace(" ", "_")
+    is_text = filename and (filename.endswith('.txt') or filename.endswith('.md'))
+    linked_option_id = parts_list[0].get('optionId') if parts_list else None
 
+    _pending_uploads[upload_id] = {
+        'status': 'starting',
+        'step': 'upload',
+        'docId': doc_id,
+        'docTitle': doc_title,
+        'chunkCount': 0,
+        'rulesCreated': 0,
+        'error': None,
+        'message': 'Starting upload...'
+    }
+
+    def _bg_upload_pipeline():
+        bg_conn = None
         try:
-            try:
-                parts_list = json.loads(linkedParts)
-            except:
-                parts_list = []
-            
-            doc_id = f"DOC-{uuid.uuid4().hex[:8]}"
-            doc_title = filename
-            staged_filename = doc_title.replace("'", "").replace(" ", "_")
+            bg_conn = _create_connection()
+            stage_path = f"@{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_STAGE/{staged_filename}"
+            doc_title_escaped = doc_title.replace("'", "''")
 
             try:
-                check_result = {}
-                def _check():
-                    try:
-                        cursor = upload_conn.cursor()
-                        try:
-                            cursor.execute(f"""
-                                SELECT DISTINCT DOC_ID FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_CHUNKED
-                                WHERE DOC_TITLE = '{doc_title.replace("'", "''")}' LIMIT 1
-                            """)
-                            if cursor.description:
-                                cols = [c[0] for c in cursor.description]
-                                rows = cursor.fetchall()
-                                check_result['data'] = [dict(zip(cols, r)) for r in rows]
-                        finally:
-                            cursor.close()
-                    except:
-                        pass
-                t = threading.Thread(target=_check)
-                t.start()
-                t.join(timeout=10)
-                existing = check_result.get('data', [])
-                if existing:
-                    old_doc_id = existing[0]['DOC_ID']
-                    print(f"Cleaning up existing doc {old_doc_id} for {doc_title}")
-                    def _cleanup():
-                        try:
-                            c = upload_conn.cursor()
-                            c.execute(f"DELETE FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_CHUNKED WHERE DOC_ID = '{old_doc_id}'")
-                            c.close()
-                            c = upload_conn.cursor()
-                            c.execute(f"DELETE FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.VALIDATION_RULES WHERE DOC_ID = '{old_doc_id}'")
-                            c.close()
-                        except Exception as e:
-                            print(f"Cleanup error: {e}")
-                    ct = threading.Thread(target=_cleanup)
-                    ct.start()
-                    ct.join(timeout=10)
+                cursor = bg_conn.cursor()
+                try:
+                    cursor.execute(f"""
+                        SELECT DISTINCT DOC_ID FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_CHUNKED
+                        WHERE DOC_TITLE = '{doc_title_escaped}' LIMIT 1
+                    """)
+                    if cursor.description:
+                        cols = [c[0] for c in cursor.description]
+                        rows = cursor.fetchall()
+                        existing = [dict(zip(cols, r)) for r in rows]
+                        if existing:
+                            old_doc_id = existing[0]['DOC_ID']
+                            print(f"Cleaning up existing doc {old_doc_id} for {doc_title}")
+                            cursor.execute(f"DELETE FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_CHUNKED WHERE DOC_ID = '{old_doc_id}'")
+                            cursor.execute(f"DELETE FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.VALIDATION_RULES WHERE DOC_ID = '{old_doc_id}'")
+                finally:
+                    cursor.close()
             except Exception as cleanup_err:
                 print(f"Warning: dedup cleanup failed: {cleanup_err}")
-            
-            is_text = filename and (filename.endswith('.txt') or filename.endswith('.md'))
-            stage_path = f"@{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_STAGE/{staged_filename}"
-            
-            # Step 1: Upload to stage
-            yield f"data: {json.dumps({'step': 'upload', 'status': 'active', 'message': 'Uploading to stage...'})}\n\n"
-            
+
+            _pending_uploads[upload_id].update({'step': 'upload', 'message': 'Uploading to stage...'})
+
             if is_text:
                 try:
                     full_text = content.decode('utf-8')
                 except:
                     full_text = content.decode('latin-1')
-                yield f"data: {json.dumps({'step': 'upload', 'status': 'done'})}\n\n"
             else:
                 import tempfile as _tempfile
                 print(f"Uploading {staged_filename} directly ({len(content)} bytes)")
-                
+                tmp_dir = _tempfile.gettempdir()
+                tmp_path = os.path.join(tmp_dir, staged_filename)
+                with open(tmp_path, 'wb') as f:
+                    f.write(content)
+                stage_ref = f"@{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_STAGE"
+                put_sql = f"PUT 'file://{tmp_path}' '{stage_ref}' AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+                cursor = bg_conn.cursor()
                 try:
-                    tmp_dir = _tempfile.gettempdir()
-                    tmp_path = os.path.join(tmp_dir, staged_filename)
-                    with open(tmp_path, 'wb') as f:
-                        f.write(content)
-                    
-                    stage_ref = f"@{SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_STAGE"
-                    put_sql = f"PUT 'file://{tmp_path}' '{stage_ref}' AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
-                    yield from _run_sql(put_sql)
-                    
-                    try:
-                        os.unlink(tmp_path)
-                    except:
-                        pass
-                    
-                    yield f"data: {json.dumps({'step': 'upload', 'status': 'done', 'message': 'File staged'})}\n\n"
-                    
-                except Exception as e:
-                    print(f"Stage upload failed: {e}")
-                    yield f"data: {json.dumps({'step': 'upload', 'status': 'error', 'message': str(e)})}\n\n"
-                    yield f"data: {json.dumps({'type': 'result', 'success': False, 'error': str(e)})}\n\n"
-                    return
-            
-            # Step 2: Extract text + chunk + insert in one SQL operation
-            yield f"data: {json.dumps({'step': 'extract', 'status': 'active', 'message': 'Extracting & chunking document...'})}\n\n"
-            
+                    cursor.execute(put_sql)
+                finally:
+                    cursor.close()
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass
+
+            _pending_uploads[upload_id].update({'step': 'extract', 'message': 'Extracting & chunking document...'})
+
             chunk_count = 0
-            
             if is_text:
                 chunk_escaped = full_text.replace("'", "''").replace("\\", "\\\\")
-                yield from _run_sql(f"""
-                    INSERT INTO {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_CHUNKED
-                    (DOC_ID, DOC_TITLE, DOC_PATH, CHUNK_INDEX, CHUNK_TEXT)
-                    SELECT '{doc_id}', '{doc_title.replace("'", "''")}', '{stage_path}', 0, '{chunk_escaped}'
-                """)
-                chunk_count = 1
-            else:
+                cursor = bg_conn.cursor()
                 try:
-                    insert_sql = f"""
+                    cursor.execute(f"""
                         INSERT INTO {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_CHUNKED
                         (DOC_ID, DOC_TITLE, DOC_PATH, CHUNK_INDEX, CHUNK_TEXT)
-                        WITH parsed AS (
-                            SELECT AI_PARSE_DOCUMENT(
-                                TO_FILE('{stage_path}'),
-                                {{'mode': 'LAYOUT', 'page_split': true}}
-                            ) AS PARSED
-                        ),
-                        pages AS (
-                            SELECT
-                                p.value:index::INT AS PAGE_INDEX,
-                                p.value:content::VARCHAR AS PAGE_CONTENT
-                            FROM parsed,
-                                LATERAL FLATTEN(input => parsed.PARSED:pages) p
-                            WHERE LENGTH(TRIM(p.value:content::VARCHAR)) > 0
-                        )
-                        SELECT
-                            '{doc_id}',
-                            '{doc_title.replace("'", "''")}',
-                            '{stage_path}',
-                            PAGE_INDEX,
-                            PAGE_CONTENT
-                        FROM pages
-                        ORDER BY PAGE_INDEX
-                    """
-                    insert_box = {}
-                    def _run_insert():
-                        try:
-                            cursor = upload_conn.cursor()
-                            try:
-                                cursor.execute(insert_sql)
-                                insert_box['rowcount'] = cursor.rowcount
-                            finally:
-                                cursor.close()
-                        except Exception as ex:
-                            insert_box['error'] = ex
-                    t = threading.Thread(target=_run_insert)
-                    t.start()
-                    while t.is_alive():
-                        yield ": keepalive\n\n"
-                        t.join(timeout=2)
-                    if 'error' in insert_box:
-                        raise insert_box['error']
-                    chunk_count = insert_box.get('rowcount', 0)
-                    
-                except Exception as e:
-                    print(f"Extract+chunk failed: {e}")
-                    yield f"data: {json.dumps({'step': 'extract', 'status': 'error', 'message': str(e)})}\n\n"
-                    yield f"data: {json.dumps({'type': 'result', 'success': False, 'error': str(e)})}\n\n"
-                    return
-            
+                        SELECT '{doc_id}', '{doc_title_escaped}', '{stage_path}', 0, '{chunk_escaped}'
+                    """)
+                    chunk_count = 1
+                finally:
+                    cursor.close()
+            else:
+                insert_sql = f"""
+                    INSERT INTO {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_CHUNKED
+                    (DOC_ID, DOC_TITLE, DOC_PATH, CHUNK_INDEX, CHUNK_TEXT)
+                    WITH parsed AS (
+                        SELECT AI_PARSE_DOCUMENT(
+                            TO_FILE('{stage_path}'),
+                            {{'mode': 'OCR'}}
+                        ) AS PARSED
+                    )
+                    SELECT
+                        '{doc_id}',
+                        '{doc_title_escaped}',
+                        '{stage_path}',
+                        0,
+                        PARSED:content::VARCHAR
+                    FROM parsed
+                    WHERE LENGTH(TRIM(PARSED:content::VARCHAR)) > 0
+                """
+                cursor = bg_conn.cursor()
+                try:
+                    cursor.execute(insert_sql)
+                    chunk_count = cursor.rowcount
+                finally:
+                    cursor.close()
+
             if chunk_count == 0:
-                yield f"data: {json.dumps({'step': 'extract', 'status': 'error', 'message': 'No content extracted'})}\n\n"
-                yield f"data: {json.dumps({'type': 'result', 'success': False, 'error': 'Failed to extract content'})}\n\n"
+                _pending_uploads[upload_id].update({'status': 'error', 'error': 'No content extracted from document'})
                 return
-            
+
             print(f"Extracted and inserted {chunk_count} chunks for {doc_title}")
-            yield f"data: {json.dumps({'step': 'extract', 'status': 'done', 'message': f'{chunk_count} pages extracted'})}\n\n"
-            
-            # Fetch the text back for rule extraction
-            text_box = {}
-            def _fetch_text():
-                try:
-                    cursor = upload_conn.cursor()
-                    try:
-                        cursor.execute(f"""
-                            SELECT CHUNK_TEXT FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_CHUNKED
-                            WHERE DOC_ID = '{doc_id}' ORDER BY CHUNK_INDEX LIMIT 5
-                        """)
-                        cols = [c[0] for c in cursor.description]
-                        rows = cursor.fetchall()
-                        text_box['data'] = [dict(zip(cols, r)) for r in rows]
-                    finally:
-                        cursor.close()
-                except Exception as ex:
-                    text_box['error'] = ex
-            ft = threading.Thread(target=_fetch_text)
-            ft.start()
-            while ft.is_alive():
-                yield ": keepalive\n\n"
-                ft.join(timeout=2)
-            
-            chunks_text = [r['CHUNK_TEXT'] for r in text_box.get('data', [])]
-            combined_text = '\n\n'.join(chunks_text)[:6000]
-            
-            # Step 3: Extract validation rules using Cortex Complete
-            print(f"DEBUG: Starting rule extraction for {doc_title}, chunks: {chunk_count}")
-            yield f"data: {json.dumps({'step': 'rules', 'status': 'active', 'message': 'Extracting validation rules...'})}\n\n"
-            
-            linked_option_id = parts_list[0].get('optionId') if parts_list else None
-            rules_created = 0
-            rule_error_msg = None
+            _pending_uploads[upload_id].update({'chunkCount': chunk_count, 'step': 'rules', 'message': 'Extracting validation rules...'})
 
-            combined_text_escaped = combined_text.replace("\\", "\\\\").replace("'", "''")
-            doc_title_escaped = doc_title.replace("'", "''")
+            option_id_sql = f"'{linked_option_id}'" if linked_option_id else "NULL"
 
-            import re
-            max_retries = 2
-            for attempt in range(max_retries + 1):
-                try:
-                    prompt = f"""Extract component requirements from this engineering specification.
+            rules_sql = f"""
+                INSERT INTO {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.VALIDATION_RULES
+                (RULE_ID, DOC_ID, DOC_TITLE, LINKED_OPTION_ID, COMPONENT_GROUP, SPEC_NAME, MIN_VALUE, MAX_VALUE, UNIT, RAW_REQUIREMENT)
+                WITH spec_list AS (
+                    SELECT DISTINCT b.COMPONENT_GROUP, f.key AS spec_name
+                    FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.BOM_TBL b,
+                        LATERAL FLATTEN(input => TRY_PARSE_JSON(TO_VARCHAR(b.SPECS))) f
+                    WHERE TRY_TO_NUMBER(f.value::VARCHAR) IS NOT NULL
+                ),
+                grouped_specs AS (
+                    SELECT COMPONENT_GROUP,
+                           LISTAGG(DISTINCT spec_name, ', ') WITHIN GROUP (ORDER BY spec_name) AS specs
+                    FROM spec_list
+                    GROUP BY COMPONENT_GROUP
+                ),
+                spec_catalog AS (
+                    SELECT LISTAGG(COMPONENT_GROUP || ': ' || specs, '\\n')
+                        WITHIN GROUP (ORDER BY COMPONENT_GROUP) AS catalog
+                    FROM grouped_specs
+                ),
+                doc_text AS (
+                    SELECT LISTAGG(CHUNK_TEXT, '\\n\\n') WITHIN GROUP (ORDER BY CHUNK_INDEX) AS full_text
+                    FROM {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_CHUNKED
+                    WHERE DOC_ID = '{doc_id}'
+                ),
+                ai_response AS (
+                    SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2',
+                        'You are analyzing an engineering specification document. Extract all supporting component requirements.
 
-DOCUMENT: {doc_title_escaped}
+DOCUMENT CONTENT:
+' || LEFT(doc_text.full_text, 6000) || '
 
-CONTENT:
-{combined_text_escaped}
+AVAILABLE COMPONENT GROUPS AND THEIR SPEC NAMES IN OUR SYSTEM:
+' || spec_catalog.catalog || '
 
-Extract numeric requirements for supporting components. Valid component groups and their spec names:
-- Turbocharger: boost_psi, max_hp_supported
-- Radiator: cooling_capacity_btu, core_rows
-- Transmission Type: torque_rating_lb_ft
-- Engine Brake Type: braking_hp, brake_stages
-- Frame Rails: yield_strength_psi, rbm_rating_in_lb
-- Axle Rating: gawr_lb, beam_thickness_in
-- Front Suspension Type: spring_rating_lb
-- Rear Suspension Type: spring_rating_lb
+INSTRUCTIONS:
+1. Find the Supporting Component Requirements section of the document
+2. For each component requirement mentioned, match it to the closest COMPONENT_GROUP from our system
+3. Extract the numeric spec values and match them to the correct SPEC_NAME from our system
+4. Return ONLY requirements that match our system component groups and spec names
 
-For each requirement, return JSON with the EXACT componentGroup name from above.
-
-Return JSON array:
+Return a JSON array:
 [
-  {{"componentGroup": "Turbocharger", "specName": "boost_psi", "minValue": 45, "unit": "PSI", "rawRequirement": "minimum 45 PSI boost"}},
-  {{"componentGroup": "Frame Rails", "specName": "yield_strength_psi", "minValue": 80000, "unit": "PSI", "rawRequirement": "80,000 PSI yield strength"}}
+  {{"componentGroup": "exact group name from list above", "specName": "exact spec name from list above", "minValue": number_or_null, "maxValue": number_or_null, "unit": "unit string", "rawRequirement": "original text from document"}}
 ]
 
-Return [] if no numeric requirements found. Return ONLY the JSON array."""
+Return [] if no matching requirements found. Return ONLY the JSON array.'
+                    ) AS response
+                    FROM doc_text, spec_catalog
+                ),
+                parsed_rules AS (
+                    SELECT
+                        r.value:componentGroup::VARCHAR AS component_group,
+                        r.value:specName::VARCHAR AS spec_name,
+                        r.value:minValue::NUMBER(38,2) AS min_value,
+                        r.value:maxValue::NUMBER(38,2) AS max_value,
+                        r.value:unit::VARCHAR AS unit,
+                        r.value:rawRequirement::VARCHAR AS raw_requirement
+                    FROM ai_response,
+                        LATERAL FLATTEN(input => TRY_PARSE_JSON(
+                            REGEXP_SUBSTR(REPLACE(REPLACE(response, '```json', ''), '```', ''), '\\\\[[\\\\s\\\\S]*\\\\]')
+                        )) r
+                    WHERE r.value:componentGroup IS NOT NULL
+                )
+                SELECT
+                    UUID_STRING(),
+                    '{doc_id}',
+                    '{doc_title_escaped}',
+                    {option_id_sql},
+                    component_group,
+                    spec_name,
+                    min_value,
+                    max_value,
+                    unit,
+                    raw_requirement
+                FROM parsed_rules
+            """
 
-                    prompt_escaped = prompt.replace("\\", "\\\\").replace("'", "''")
-
-                    ai_box = {}
-                    def _run_ai():
-                        try:
-                            cursor = upload_conn.cursor()
-                            try:
-                                cursor.execute(f"""
-                                    SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{prompt_escaped}') AS RESPONSE
-                                """)
-                                if cursor.description:
-                                    cols = [c[0] for c in cursor.description]
-                                    rows = cursor.fetchall()
-                                    ai_box['data'] = [dict(zip(cols, r)) for r in rows]
-                            finally:
-                                cursor.close()
-                        except Exception as ex:
-                            ai_box['error'] = ex
-                    at = threading.Thread(target=_run_ai)
-                    at.start()
-                    while at.is_alive():
-                        yield ": keepalive\n\n"
-                        at.join(timeout=2)
-                    if 'error' in ai_box:
-                        raise ai_box['error']
-                    ai_result = ai_box.get('data', [])
-
-                    if not ai_result or len(ai_result) == 0:
-                        rule_error_msg = f"CORTEX.COMPLETE returned no result (attempt {attempt + 1})"
-                        print(f"DEBUG: {rule_error_msg}")
-                        continue
-
-                    response = ai_result[0].get("RESPONSE", "").strip()
-                    print(f"DEBUG: AI response (attempt {attempt + 1}): {response[:300]}...")
-                    response = response.replace("```json", "").replace("```", "").strip()
-
-                    json_match = re.search(r'\[[\s\S]*?\]', response)
-                    if not json_match:
-                        rule_error_msg = f"No JSON array found in LLM response (attempt {attempt + 1})"
-                        print(f"DEBUG: {rule_error_msg}. Raw response: {response[:500]}")
-                        continue
-
-                    rules = json.loads(json_match.group(0))
-                    if not isinstance(rules, list):
-                        rule_error_msg = f"LLM returned non-list JSON (attempt {attempt + 1})"
-                        print(f"DEBUG: {rule_error_msg}")
-                        continue
-
-                    valid_groups = {'Turbocharger', 'Radiator', 'Transmission Type', 'Engine Brake Type',
-                                    'Frame Rails', 'Axle Rating', 'Front Suspension Type', 'Rear Suspension Type'}
-                    
-                    rule_values = []
-                    for rule in rules:
-                        if not isinstance(rule, dict):
-                            continue
-                        component_group = rule.get('componentGroup', '').replace("'", "''")
-                        spec_name = rule.get('specName', '').replace("'", "''")
-                        min_value = rule.get('minValue')
-                        max_value = rule.get('maxValue')
-                        unit = rule.get('unit', '').replace("'", "''")
-                        raw_req = rule.get('rawRequirement', '').replace("'", "''")
-
-                        if min_value is None and max_value is None:
-                            continue
-                        if component_group.replace("''", "'") not in valid_groups:
-                            print(f"DEBUG: Skipping rule with invalid componentGroup: {component_group}")
-                            continue
-
-                        rule_id = str(uuid.uuid4())[:36]
-                        min_val_sql = min_value if min_value is not None else "NULL"
-                        max_val_sql = max_value if max_value is not None else "NULL"
-                        option_id_sql = f"'{linked_option_id}'" if linked_option_id else "NULL"
-                        
-                        rule_values.append(f"('{rule_id}', '{doc_id}', '{doc_title_escaped}', {option_id_sql}, '{component_group}', '{spec_name}', {min_val_sql}, {max_val_sql}, '{unit}', '{raw_req}')")
-                    
-                    if rule_values:
-                        insert_rules_sql = f"""
-                            INSERT INTO {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.VALIDATION_RULES
-                            (RULE_ID, DOC_ID, DOC_TITLE, LINKED_OPTION_ID, COMPONENT_GROUP,
-                             SPEC_NAME, MIN_VALUE, MAX_VALUE, UNIT, RAW_REQUIREMENT)
-                            VALUES {', '.join(rule_values)}
-                        """
-                        rule_insert_box = {}
-                        def _run_rule_insert():
-                            try:
-                                cursor = upload_conn.cursor()
-                                try:
-                                    cursor.execute(insert_rules_sql)
-                                    rule_insert_box['count'] = cursor.rowcount
-                                finally:
-                                    cursor.close()
-                            except Exception as ex:
-                                rule_insert_box['error'] = ex
-                        rt = threading.Thread(target=_run_rule_insert)
-                        rt.start()
-                        while rt.is_alive():
-                            yield ": keepalive\n\n"
-                            rt.join(timeout=2)
-                        if 'error' in rule_insert_box:
-                            raise rule_insert_box['error']
-                        rules_created = rule_insert_box.get('count', len(rule_values))
-                    
-                    if rules_created > 0:
-                        print(f"Created {rules_created} validation rules for {doc_title}")
-                        rule_error_msg = None
-                        break
-                    else:
-                        rule_error_msg = f"LLM returned 0 valid rules (attempt {attempt + 1})"
-                        print(f"DEBUG: {rule_error_msg}")
-
-                except json.JSONDecodeError as je:
-                    rule_error_msg = f"JSON parse error: {je} (attempt {attempt + 1})"
-                    print(f"DEBUG: {rule_error_msg}")
-                except Exception as rule_err:
-                    import traceback
-                    rule_error_msg = f"Rule extraction error: {rule_err} (attempt {attempt + 1})"
-                    print(f"DEBUG: {rule_error_msg}")
-                    print(f"DEBUG traceback: {traceback.format_exc()}")
-
-            if rule_error_msg and rules_created == 0:
-                yield f"data: {json.dumps({'step': 'rules', 'status': 'error', 'message': rule_error_msg})}\n\n"
-            else:
-                yield f"data: {json.dumps({'step': 'rules', 'status': 'done', 'message': f'{rules_created} rules created'})}\n\n"
-            
-            # Final result
-            yield f"data: {json.dumps({'type': 'result', 'success': True, 'docId': doc_id, 'docTitle': doc_title, 'chunkCount': chunk_count, 'linkedParts': parts_list, 'rulesCreated': rules_created})}\n\n"
-            
-            def _bg_search_refresh():
-                try:
-                    conn = _create_connection()
-                    try:
-                        cursor = conn.cursor()
-                        cursor.execute(f"ALTER CORTEX SEARCH SERVICE {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_SEARCH REFRESH")
-                        cursor.close()
-                        print("Background search refresh completed")
-                    finally:
-                        conn.close()
-                except Exception as e:
-                    print(f"Background search refresh failed: {e}")
-            threading.Thread(target=_bg_search_refresh, daemon=True).start()
-            
-        except Exception as e:
-            print(f"Upload error: {e}")
-            yield f"data: {json.dumps({'type': 'result', 'success': False, 'error': str(e)})}\n\n"
-        finally:
+            rules_created = 0
+            rule_error_msg = None
             try:
-                upload_conn.close()
-            except:
-                pass
-    
-    return StreamingResponse(
-        generate_progress(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
-    )
+                cursor = bg_conn.cursor()
+                try:
+                    cursor.execute(rules_sql)
+                    rules_created = cursor.rowcount
+                    print(f"Created {rules_created} validation rules for {doc_title}")
+                finally:
+                    cursor.close()
+            except Exception as rule_err:
+                import traceback
+                rule_error_msg = f"Rule extraction error: {rule_err}"
+                print(f"DEBUG: {rule_error_msg}")
+                print(f"DEBUG traceback: {traceback.format_exc()}")
+
+            _pending_uploads[upload_id].update({
+                'status': 'done',
+                'rulesCreated': rules_created,
+                'step': 'done',
+                'message': f'{rules_created} rules created' if rules_created > 0 else (rule_error_msg or 'No rules extracted'),
+                'error': rule_error_msg if rules_created == 0 else None
+            })
+
+            try:
+                cursor = bg_conn.cursor()
+                cursor.execute(f"ALTER CORTEX SEARCH SERVICE {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}.ENGINEERING_DOCS_SEARCH REFRESH")
+                cursor.close()
+                print("Background search refresh completed")
+            except Exception as e:
+                print(f"Background search refresh failed: {e}")
+
+        except Exception as e:
+            import traceback
+            print(f"Background upload pipeline failed: {e}")
+            print(f"DEBUG traceback: {traceback.format_exc()}")
+            _pending_uploads[upload_id].update({'status': 'error', 'error': str(e)})
+        finally:
+            if bg_conn:
+                try:
+                    bg_conn.close()
+                except:
+                    pass
+
+    threading.Thread(target=_bg_upload_pipeline, daemon=True).start()
+    return {"uploadId": upload_id, "docId": doc_id, "docTitle": doc_title}
+
+@app.get("/api/engineering-docs/upload-status")
+def get_upload_status(uploadId: str):
+    status = _pending_uploads.get(uploadId)
+    if not status:
+        return {"status": "unknown", "error": "Upload not found"}
+    return status
 
 # ============ CHAT HISTORY ============
 
