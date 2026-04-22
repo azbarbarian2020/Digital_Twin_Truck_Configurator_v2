@@ -317,7 +317,7 @@ Drops service, EAI, compute pool, schema, and warehouse. Preserves RSA keys, use
 | `scripts/02b_bom_data.sql` | BOM options data |
 | `scripts/02c_truck_options.sql` | Model-option mappings |
 | `scripts/02d_app_tables.sql` | App tables + Cortex Search Service |
-| `scripts/02e_upload_procedure.sql` | (Legacy) Upload stored procedure |
+| `scripts/02e_upload_procedure.sql` | Deprecated — V2 uses AI_PARSE_DOCUMENT in main.py directly |
 | `scripts/03_semantic_view.sql` | Semantic View for Cortex Analyst |
 | `scripts/05_service.sql` | Service creation template |
 
